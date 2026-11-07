@@ -1,0 +1,23 @@
+"""Train XSoma on Holosoma's G1 velocity-tracking task (one GPU).
+
+    python train.py --log_dir runs/xsoma            # 20 minutes of training, then every checkpoint is evaluated
+
+Every option of xsoma/train.py's Config is a flag (--name value); the defaults are the published H100 configuration.
+Checkpoints, log.jsonl, config.json and eval.jsonl go to --log_dir.
+"""
+
+import os
+
+
+def runtime_defaults():
+    """JAX settings, unless set already (they must be in place before JAX starts): 90 % of the GPU memory preallocated, and
+    Python tracebacks left out of the compiled programs' metadata (smaller programs in the compilation cache)."""
+    os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.9")
+    os.environ.setdefault("JAX_INCLUDE_FULL_TRACEBACKS_IN_LOCATIONS", "false")
+
+
+if __name__ == "__main__":
+    runtime_defaults()
+    from xsoma.train import main
+
+    main()
