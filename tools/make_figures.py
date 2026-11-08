@@ -28,10 +28,11 @@ from matplotlib.patches import PathPatch  # noqa: E402
 from matplotlib.path import Path  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-METHODS = ("xsoma", "fast_sac", "ppo")
-LABEL = {"xsoma": "XSoma", "fast_sac": "Holosoma FastSAC", "ppo": "Holosoma PPO"}
+METHODS = ("xsoma_4gpu", "xsoma", "fast_sac", "ppo")  # results/<method>/; XSoma on four GPUs (--layout) when present
+LABEL = {"xsoma_4gpu": "XSoma, 4 GPUs", "xsoma": "XSoma", "fast_sac": "Holosoma FastSAC", "ppo": "Holosoma PPO"}
+GPUS = {"xsoma_4gpu": 4}  # GPUs per run, 1 unless listed
 TARGET = {"rew_tracking_lin_vel": 0.95, "rew_tracking_ang_vel": 0.8}
-STEPS_PER = {"xsoma": 1, "fast_sac": 4096, "ppo": 24 * 4096}  # env steps per unit of a record's "steps" (Holosoma: iterations)
+STEPS_PER = {"xsoma_4gpu": 1, "xsoma": 1, "fast_sac": 4096, "ppo": 24 * 4096}  # env steps per unit of a record's "steps" (Holosoma: iterations)
 HELD = 3
 BUDGET = 15.0  # minutes shown: every method's comparison is decided within them
 METRICS = (("rew_tracking_lin_vel", "Velocity tracking", "Holosoma's Episode/rew_tracking_lin_vel (max 2.0); dashed: the target", 0.95),
@@ -39,9 +40,9 @@ METRICS = (("rew_tracking_lin_vel", "Velocity tracking", "Holosoma's Episode/rew
            ("success", "Episodes without a fall", "share of 2048 episodes of 20 s", None))  # fmt: skip
 THEMES = {  # XMimic's release palette: the method in teal, the baselines in grays, ink on white (dark: GitHub's background)
     "light": dict(surface="#ffffff", ink="#1d1d1f", ink2="#48484e", muted="#8e8e93", grid="#e5e5ea", axis="#c7c7cc",
-                  xsoma="#00b0be", fast_sac="#6e6e73", ppo="#aeaeb2"),
+                  xsoma="#00b0be", xsoma_4gpu="#00b0be", fast_sac="#6e6e73", ppo="#aeaeb2"),
     "dark": dict(surface="#0d1117", ink="#f0f6fc", ink2="#c9d1d9", muted="#8b949e", grid="#21262d", axis="#30363d",
-                 xsoma="#19c3d0", fast_sac="#aeaeb2", ppo="#636366"),
+                 xsoma="#19c3d0", xsoma_4gpu="#19c3d0", fast_sac="#aeaeb2", ppo="#636366"),
 }  # fmt: skip
 FONT = ["Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"]
 
@@ -54,6 +55,8 @@ def training_seconds(run, rows):
     checkpoint's time since launch minus the start-up. Holosoma compiles (torch.compile, CUDA graphs) inside its training
     loop: train_log.csv holds the time it logs since its loop started ("Total time") per logged iteration, and the first
     logged interval's excess over the steady pace, its one-time compilation, is removed."""
+    if all("train_s" in r for r in rows):  # recorded with the checkpoint
+        return [r["train_s"] for r in rows]
     if os.path.exists(os.path.join(run, "log.jsonl")):
         startup = float(np.median([r["wall_s"] - r["train_s"] for r in map(json.loads, open(os.path.join(run, "log.jsonl")))]))
         return [r["wall_s"] - startup for r in rows]
@@ -63,6 +66,11 @@ def training_seconds(run, rows):
         excess = total[0] - pace * (it[0] + 1)  # the first logged interval covers iterations 0 to it[0]
         return [float(np.interp(r["steps"], it, total)) - excess for r in rows]  # Holosoma's steps are iterations
     return [r["wall_s"] for r in rows]  # no log: time since launch
+
+
+def name(m, present):
+    """A method's label; XSoma on one GPU says so once a multi-GPU XSoma is shown next to it."""
+    return "XSoma, 1 GPU" if m == "xsoma" and any(GPUS.get(k, 1) > 1 for k in present) else LABEL[m]
 
 
 def load_results(root=os.path.join(ROOT, "results")):
@@ -170,7 +178,9 @@ def learning_curves(results, theme, out):
                 mean, lo, hi = np.nanmean(v, 0), np.nanmin(v, 0), np.nanmax(v, 0)
             live = ~np.isnan(v).any(0)  # where every run has data, so the mean never mixes different sets of runs
             ax.fill_between(grid[live], lo[live], hi[live], color=t[m], alpha=0.12, lw=0, zorder=2)
-            ax.plot(grid[live], mean[live], color=t[m], lw=2.0, solid_capstyle="round", solid_joinstyle="round", zorder=3, label=LABEL[m])
+            dashed = m == "xsoma" and "xsoma_4gpu" in results  # as in XMimic's figures: one GPU dashed, four solid
+            ax.plot(grid[live], mean[live], color=t[m], lw=2.0, ls=(0, (4, 2)) if dashed else "-", solid_capstyle="round",
+                    solid_joinstyle="round", zorder=3, label=name(m, results))  # fmt: skip
         if line is not None:
             ax.axhline(line, color=t["muted"], lw=1.0, ls=(0, (4, 3)), zorder=1)
         ax.set_xlim(0, BUDGET)
@@ -217,7 +227,7 @@ def time_to_target_figure(summary, theme, out):
             ax.text(max(s["held"]) + top * 0.02, i, label, va="center", ha="left", color=t["ink"], fontsize=10.5)
         else:
             ax.text(top * 0.01, i, f"not reached in {5 * round(s['end'] / 5):.0f} min ({runs})", va="center", ha="left", color=t["ink2"], fontsize=10.5)
-    ax.set_yticks(range(n), [LABEL[m] for m in keys], color=t["ink"], fontsize=11)
+    ax.set_yticks(range(n), [name(m, keys) for m in keys], color=t["ink"], fontsize=11)
     ax.set_xticks(np.arange(0, top + 1, 5))
     ax.set_xlabel("minutes of training (start-up and compilation excluded)", color=t["ink2"], fontsize=10)
     fig.text(0.012, 1 - 0.30 / fig_h, "Time to Holosoma's FastSAC bar on one H100", ha="left", va="center", color=t["ink"], fontsize=13.5,
@@ -244,7 +254,7 @@ def table(summary):
         sp = f"{ref / np.mean(s['held']):.1f}×" if ref and s["held"] and len(s["held"]) == s["runs"] else "–"
         st = f"{np.mean(s['steps']) / 1e6:.0f} M" if s["steps"] else "–"
         at = f"{s[f'err_v@{BUDGET}']:.2f} m/s, {100 * (1 - s[f'success@{BUDGET}']):.1f} %" if f"err_v@{BUDGET}" in s else "–"
-        lines.append(f"| {LABEL[m]} | {s['runs']} | {tt} | {sp} | {st} | {at} |")
+        lines.append(f"| {name(m, summary)} | {s['runs']} | {tt} | {sp} | {st} | {at} |")
     return "\n".join(lines)
 
 

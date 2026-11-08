@@ -95,6 +95,9 @@ class Config:
     jax_cache: str = "~/.cache/xsoma/jax"  # persistent compilation cache ("" for none): later runs load their programs
     xla_flags: str = "--xla_gpu_enable_triton_gemm=false"  # extra XLA flags, comma-separated, set before JAX's backend starts
     #                                                        (cuBLAS for every GEMM: faster on Hopper, neutral elsewhere)
+    # several GPUs (multi_gpu.py)
+    layout: str = "1GPU"  # 1GPU | AL: GPU 0 collects and fits the world model, the other GPUs update the policy
+    learners: int = 0  # AL: the number of GPUs that update the policy; 0: every visible GPU but the first
 
 
 # The world-model loss measures each state dimension's error in units of its typical one-step change, but never below these
@@ -423,6 +426,10 @@ def main(argv=None):
     os.makedirs(os.path.join(cfg.log_dir, "ckpt"), exist_ok=True)
     with open(os.path.join(cfg.log_dir, "config.json"), "w") as f:
         json.dump(dataclasses.asdict(cfg), f, indent=1)
+    if cfg.layout != "1GPU":  # several GPUs: multi_gpu.run trains, logs, saves checkpoints and evaluates in the same formats
+        from .multi_gpu import run
+
+        return run(cfg, t_launch)
     t_build = time.time()
     xs = XSoma(cfg)
     carry = xs.init(jax.random.PRNGKey(cfg.seed))
