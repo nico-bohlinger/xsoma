@@ -31,8 +31,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 METHODS = ("xsoma_4gpu", "xsoma", "fast_sac", "ppo")  # results/<method>/; XSoma on four GPUs (--layout) when present
 LABEL = {"xsoma_4gpu": "XSoma, 4 GPUs", "xsoma": "XSoma", "fast_sac": "Holosoma FastSAC", "ppo": "Holosoma PPO"}
 GPUS = {"xsoma_4gpu": 4}  # GPUs per run, 1 unless listed
+# FastSAC's time to the target comes from runs with a checkpoint every ~15 s (14 min each), its learning curves and its
+# tracking after 15 minutes from runs of its whole 50-minute schedule with a checkpoint every minute
+LONG = {"fast_sac": "fast_sac_full"}
 TARGET = {"rew_tracking_lin_vel": 0.95, "rew_tracking_ang_vel": 0.8}
-STEPS_PER = {"xsoma_4gpu": 1, "xsoma": 1, "fast_sac": 4096, "ppo": 24 * 4096}  # env steps per unit of a record's "steps" (Holosoma: iterations)
+STEPS_PER = {"xsoma_4gpu": 1, "xsoma": 1, "fast_sac": 4096, "fast_sac_full": 4096, "ppo": 24 * 4096}  # env steps per unit of a record's "steps" (Holosoma: iterations)
 HELD = 3
 BUDGET = 15.0  # minutes shown: every method's comparison is decided within them
 METRICS = (("rew_tracking_lin_vel", "Velocity tracking", "Holosoma's Episode/rew_tracking_lin_vel (max 2.0); dashed: the target", 0.95),
@@ -76,7 +79,7 @@ def name(m, present):
 def load_results(root=os.path.join(ROOT, "results")):
     """{method: [rows of each run, sorted by training time]}."""
     out = {}
-    for m in METHODS:
+    for m in METHODS + tuple(LONG.values()):
         runs = []
         for path in sorted(glob.glob(os.path.join(root, m, "*", "eval.jsonl"))):
             rows = [json.loads(line) for line in open(path)]
@@ -105,9 +108,9 @@ def time_to_target(rows, held=HELD):
 
 
 def value_at(rows, key, minute):
-    """A run's metric after some minutes of training: its last checkpoint at or before then."""
+    """A run's metric after some minutes of training: its last checkpoint at or before then (None if the run ended earlier)."""
     before = [r for r in rows if r["min"] <= minute]
-    return before[-1][key] if before else None
+    return before[-1][key] if before and rows[-1]["min"] >= minute - 1.0 else None
 
 
 def summarize(results):
@@ -172,7 +175,7 @@ def learning_curves(results, theme, out):
         for m in METHODS:
             if m not in results:
                 continue
-            v = curve(results[m], key, grid)
+            v = curve(results[LONG.get(m, m)] if LONG.get(m) in results else results[m], key, grid)
             with np.errstate(all="ignore"), warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)  # grid points no run covers
                 mean, lo, hi = np.nanmean(v, 0), np.nanmin(v, 0), np.nanmax(v, 0)
@@ -195,7 +198,7 @@ def learning_curves(results, theme, out):
             ax.set_ylim(0, 1.2)
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper right", ncol=len(labels), frameon=False, fontsize=10, labelcolor=t["ink"], bbox_to_anchor=(0.995, 0.995))
-    fig.text(0.008, 0.965, "Learning curves on one H100", ha="left", va="center", color=t["ink"], fontsize=13.5, fontweight="bold")
+    fig.text(0.008, 0.965, "Learning curves on H100 GPUs", ha="left", va="center", color=t["ink"], fontsize=13.5, fontweight="bold")
     fig.text(0.008, 0.905, "deterministic evaluation of every checkpoint; line: mean over runs, band: min to max", ha="left", va="center",
              color=t["ink2"], fontsize=10)  # fmt: skip
     fig.tight_layout(rect=(0, 0, 1, 0.86), w_pad=2.5)
@@ -223,14 +226,14 @@ def time_to_target_figure(summary, theme, out):
             mean = float(np.mean(s["held"]))
             rounded_bar(ax, i, mean, 0.5, t[m])
             ax.scatter(s["held"], [i] * len(s["held"]), s=34, facecolor=t[m], edgecolors=t["surface"], linewidths=2.0, zorder=3)
-            label = f"{mean:.1f} min" + (f"   ({len(s['held'])} of {runs})" if len(s["held"]) < s["runs"] else "")
+            label = f"{mean:.2f} min" + (f"   ({len(s['held'])} of {runs})" if len(s["held"]) < s["runs"] else "")
             ax.text(max(s["held"]) + top * 0.02, i, label, va="center", ha="left", color=t["ink"], fontsize=10.5)
         else:
             ax.text(top * 0.01, i, f"not reached in {5 * round(s['end'] / 5):.0f} min ({runs})", va="center", ha="left", color=t["ink2"], fontsize=10.5)
     ax.set_yticks(range(n), [name(m, keys) for m in keys], color=t["ink"], fontsize=11)
     ax.set_xticks(np.arange(0, top + 1, 5))
     ax.set_xlabel("minutes of training (start-up and compilation excluded)", color=t["ink2"], fontsize=10)
-    fig.text(0.012, 1 - 0.30 / fig_h, "Time to Holosoma's FastSAC bar on one H100", ha="left", va="center", color=t["ink"], fontsize=13.5,
+    fig.text(0.012, 1 - 0.30 / fig_h, "Time to Holosoma's FastSAC bar on H100 GPUs", ha="left", va="center", color=t["ink"], fontsize=13.5,
              fontweight="bold")  # fmt: skip
     fig.text(0.012, 1 - 0.60 / fig_h, "velocity tracking ≥ 0.95 and yaw-rate tracking ≥ 0.8 (Holosoma's nightly test), held for 3 checkpoints; dots: runs",
              ha="left", va="center", color=t["ink2"], fontsize=10)  # fmt: skip
@@ -247,14 +250,43 @@ def table(summary):
             continue
         s = summary[m]
         if s["held"]:
-            tt = f"{np.mean(s['held']):.1f} ({min(s['held']):.1f}–{max(s['held']):.1f})" if len(s["held"]) > 1 else f"{s['held'][0]:.1f}"
+            tt = f"{np.mean(s['held']):.2f} ({min(s['held']):.2f}–{max(s['held']):.2f})" if len(s["held"]) > 1 else f"{s['held'][0]:.2f}"
             tt += f", {len(s['held'])} of {s['runs']} runs" if len(s["held"]) < s["runs"] else ""
         else:
             tt = f"not within {5 * round(s['end'] / 5):.0f}"  # the run length
         sp = f"{ref / np.mean(s['held']):.1f}×" if ref and s["held"] and len(s["held"]) == s["runs"] else "–"
         st = f"{np.mean(s['steps']) / 1e6:.0f} M" if s["steps"] else "–"
-        at = f"{s[f'err_v@{BUDGET}']:.2f} m/s, {100 * (1 - s[f'success@{BUDGET}']):.1f} %" if f"err_v@{BUDGET}" in s else "–"
+        q = summary.get(LONG.get(m), s)  # tracking after BUDGET minutes from the runs that are that long
+        at = f"{q[f'err_v@{BUDGET}']:.2f} m/s, {100 * (1 - q[f'success@{BUDGET}']):.1f} %" if f"err_v@{BUDGET}" in q else "–"
         lines.append(f"| {name(m, summary)} | {s['runs']} | {tt} | {sp} | {st} | {at} |")
+    return "\n".join(lines)
+
+
+def layouts_table(root=os.path.join(ROOT, "results")):
+    """XSoma on 1 to 4 GPUs (results/xsoma and results/xsoma_<n>gpu): speed from log.jsonl, time to target from eval.jsonl."""
+    keys = [k for k in ("xsoma", "xsoma_2gpu", "xsoma_3gpu", "xsoma_4gpu") if os.path.isdir(os.path.join(root, k))]
+    rows = {}
+    for k in keys:
+        runs = []
+        for path in sorted(glob.glob(os.path.join(root, k, "*", "eval.jsonl"))):
+            ev = [json.loads(line) for line in open(path)]
+            for r, t in zip(ev, training_seconds(os.path.dirname(path), ev)):
+                r["min"] = t / 60
+            log = [json.loads(line) for line in open(os.path.join(os.path.dirname(path), "log.jsonl"))]
+            cfg = json.load(open(os.path.join(os.path.dirname(path), "config.json")))
+            learners = int(cfg.get("learners") or 1)
+            steps = learners * -(-int(cfg["pi_updates"]) // learners) if cfg.get("layout", "1GPU") != "1GPU" else int(cfg["pi_updates"])
+            runs.append((time_to_target(sorted(ev, key=lambda r: r["min"])), log[-1]["it"] / log[-1]["train_s"], log[-1]["env_steps"] / log[-1]["train_s"], steps))
+        rows[k] = runs
+    one = float(np.mean([r[0] for r in rows["xsoma"] if r[0] is not None])) if "xsoma" in rows else None
+    lines = ["| GPUs | runs | iterations/s | env steps/s | policy updates per iteration | time to target (min) | speedup over 1 GPU |",
+             "|---|---|---|---|---|---|---|"]  # fmt: skip
+    for k, runs in rows.items():
+        held = [r[0] for r in runs if r[0] is not None]
+        n = 1 if k == "xsoma" else int(k.split("_")[1][:-3])
+        tt = f"{np.mean(held):.2f} ({min(held):.2f}–{max(held):.2f})" if held else "–"
+        lines.append(f"| {n} | {len(runs)} | {np.mean([r[1] for r in runs]):.1f} | {np.mean([r[2] for r in runs]) / 1e3:.0f} k | {runs[0][3]} | {tt} | "
+                     f"{one / np.mean(held):.1f}× |" if held and one else "–")  # fmt: skip
     return "\n".join(lines)
 
 
@@ -270,6 +302,8 @@ def main():
         learning_curves(results, theme, a.figures)
         time_to_target_figure(summary, theme, a.figures)
     print(table(summary))
+    print()
+    print(layouts_table(a.results))
     print(json.dumps(summary, indent=1))
 
 

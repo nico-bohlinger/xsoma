@@ -106,20 +106,22 @@ def text_panel(summ):
     d = ImageDraw.Draw(img)
     x = 40
     t_x, t_f = np.mean(summ["xsoma"]["held"]), np.mean(summ["fast_sac"]["held"])
+    t_best = np.mean(summ["xsoma_4gpu"]["held"]) if "xsoma_4gpu" in summ else t_x  # the headline: XSoma's fastest layout
     d.text((x, 40), "XSoma", font=font(48, bold=True), fill=INK)
-    d.text((x - 6, 96), f"{t_f / t_x:.1f}×", font=font(150, bold=True), fill=TEAL)
+    d.text((x - 6, 96), f"{t_f / t_best:.1f}×", font=font(150, bold=True), fill=TEAL)
     d.text((x, 266), "faster than FastSAC to", font=font(32), fill=INK)
     d.text((x, 305), "Holosoma's tracking bar", font=font(32), fill=INK)
-    num = font(40, bold=True)
-    rows = [(f"{t_x:.1f} min", TEAL, "XSoma"), (f"{t_f:.1f} min", GRAY, "FastSAC")]
+    rows = [(f"{t_best:.2f} min", TEAL, "XSoma, 4 H100s")] if "xsoma_4gpu" in summ else []
+    rows += [(f"{t_x:.2f} min", TEAL, "XSoma, 1 H100"), (f"{t_f:.2f} min", GRAY, "FastSAC, 1 H100")]
     if "ppo" in summ:
         ppo = summ["ppo"]["held"]
-        rows.append((f"{np.mean(ppo):.1f} min" if ppo else f"> {5 * round(summ['ppo']['end'] / 5):.0f} min", LIGHT, "PPO"))  # the run length
+        rows.append((f"{np.mean(ppo):.2f} min" if ppo else f"> {5 * round(summ['ppo']['end'] / 5):.0f} min", LIGHT, "PPO, 1 H100"))  # the run length
+    num, small = (font(40, bold=True), font(26)) if len(rows) <= 3 else (font(34, bold=True), font(23))
     off = int(max(d.textlength(r[0], font=num) for r in rows)) + 16
+    y0, dy = (372, 50) if len(rows) <= 3 else (360, 43)
     for j, (value, color, label) in enumerate(rows):
-        y = 372 + 50 * j
-        d.text((x, y), value, font=num, fill=color)
-        d.text((x + off, y + 12), label + ", 1 H100", font=font(26), fill=INK2)
+        d.text((x, y0 + dy * j), value, font=num, fill=color)
+        d.text((x + off, y0 + dy * j + 10), label, font=small, fill=INK2)
     return img
 
 

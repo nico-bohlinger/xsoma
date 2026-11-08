@@ -6,7 +6,7 @@
  "preset": "fast_sac",
  "sole_friction": 1,
  "random_start": 1,
- "minutes": 60.0,
+ "minutes": 15.0,
  "env_steps": 1,
  "buffer_steps": 200,
  "warmup_steps": 32,
@@ -35,12 +35,14 @@
  "imag_remat": "none",
  "mm_bf16": "imag",
  "log_every": 50,
- "ckpt_minutes": 1.0,
+ "ckpt_minutes": 0.217,
  "eval_n": 2048,
  "eval_scale": 0.5,
  "eval_sole_friction": 0,
  "seed": 4,
  "log_dir": "runs/seed4",
  "jax_cache": "~/.cache/xsoma/jax",
- "xla_flags": "--xla_gpu_enable_triton_gemm=false"
+ "xla_flags": "--xla_gpu_enable_triton_gemm=false",
+ "layout": "1GPU",
+ "learners": 1
 }
