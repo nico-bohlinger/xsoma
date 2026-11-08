@@ -6,6 +6,10 @@ against Holosoma's own code) with a learned world model and backpropagation thro
 H100 it passes Holosoma's own tracking bar 3.2 minutes after launch, 3.3× sooner than Holosoma's FastSAC, and ends with a
 38 % lower velocity error; Holosoma's PPO does not pass the bar within an hour.
 
+Paper: [Learning Humanoid Motion Tracking and Locomotion in Minutes Through Imagination](https://nico-bohlinger.github.io/papers/2026_xmimic_xsoma.pdf)
+(Nico Bohlinger, Jan Peters, 2026), which presents XSoma together with [XMimic](https://github.com/nico-bohlinger/xmimic).
+Please [cite it](#citation) if you use XSoma.
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="figures/time_to_target_dark.png">
   <img alt="Time to Holosoma's FastSAC tracking bar on one H100: XSoma 3.2 min, Holosoma FastSAC 10.6 min, Holosoma PPO not reached in 60 min" src="figures/time_to_target.png">
@@ -252,14 +256,18 @@ Licenses and notices of the code and model XSoma derives from: [THIRD_PARTY_NOTI
 
 ## Citation
 
+If you use XSoma in your research, please cite:
+
 ```bibtex
-@misc{bohlinger2026xsoma,
-  title  = {XSoma: Learning Humanoid Velocity Tracking on Rough Terrain in Minutes},
+@misc{bohlinger2026imagination,
+  title  = {Learning Humanoid Motion Tracking and Locomotion in Minutes Through Imagination},
   author = {Bohlinger, Nico and Peters, Jan},
   year   = {2026},
-  url    = {https://github.com/nico-bohlinger/xsoma}
+  url    = {https://nico-bohlinger.github.io/papers/2026_xmimic_xsoma.pdf}
 }
 ```
+
+XSoma learns Holosoma's task with SuperMimic's method, so please also cite them (see [Acknowledgements](#acknowledgements)).
 
 ## License
 
