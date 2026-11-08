@@ -7,6 +7,7 @@ tiny batched matmuls (InstantTrack's --fused_rot, here the only form).
 import jax.numpy as jnp
 
 
+# mm3: matrix product A B, mv3: matrix-vector product A v, tr3: transpose of A
 def mm3(A, B):
     return (A[..., :, :, None] * B[..., None, :, :]).sum(-2)
 
@@ -24,6 +25,7 @@ def normalize(v, eps=1e-12):
 
 
 def quat_to_mat(q):
+    """Rotation matrices of quaternions (wxyz); the quaternions are normalized first."""
     q = normalize(q)
     w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
     return jnp.stack(
@@ -76,6 +78,7 @@ def axis_angle_to_mat(axis, angle):
 
 
 def skew(v):
+    """The cross-product matrix K of v, with K u = v x u."""
     x, y, z = v[..., 0], v[..., 1], v[..., 2]
     o = jnp.zeros_like(x)
     return jnp.stack((o, -z, y, z, o, -x, -y, x, o), -1).reshape(v.shape[:-1] + (3, 3))
@@ -93,6 +96,7 @@ def so3_exp(v):
 
 
 def quat_to_rotvec(q):
+    """Rotation vector (axis times angle) of quaternions, for the shorter of the two equivalent rotations (w >= 0)."""
     q = q * jnp.where(q[..., :1] < 0, -1.0, 1.0)
     v = q[..., 1:]
     sin_half = jnp.linalg.norm(v, axis=-1, keepdims=True)
@@ -102,14 +106,8 @@ def quat_to_rotvec(q):
 
 
 def so3_log(R):
+    """Rotation vector of rotation matrices, the inverse of so3_exp."""
     return quat_to_rotvec(mat_to_quat(R))
-
-
-def rot_angle_sq(Ra, Rb):
-    """Squared geodesic angle between rotations (acos of the trace, clamped)."""
-    tr = (Ra * Rb).sum((-1, -2))
-    cos = jnp.clip((tr - 1) / 2, -1 + 1e-6, 1 - 1e-6)
-    return jnp.arccos(cos) ** 2
 
 
 def yaw_mat(R):

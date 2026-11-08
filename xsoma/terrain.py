@@ -1,19 +1,23 @@
 """Holosoma's `terrain_locomotion_mix` (upstream 79ba714, `simulator/shared/terrain.py`), ported draw for draw.
 
-A grid of num_rows x num_cols square tiles (8 m, 0.1 m pixels, 5 mm height units) inside a flat 40 m border. Each tile, in
-row-major order, draws its type (flat 0.2 / rough 0.6 / low_obstacles 0.2) and a difficulty in {0.5, 0.75, 0.9}:
+This module generates the terrain: its tiles, the height map that scene.py builds the heightfields from, and the tile origins
+where robots spawn. `height` reads the terrain height at any point, for the rewards, the terminations and imagination.
+
+A grid of num_rows x num_cols square tiles (8 m on a side, 0.1 m pixels, 5 mm height units) inside a flat 40 m border. Each
+tile, in row-major order, draws its type (flat 0.2 / rough 0.6 / low_obstacles 0.2) and a difficulty in {0.5, 0.75, 0.9}:
   flat           height 0
   rough          every pixel U[-0.025 - 2 * 0.025 d / 0.9, -0.025) m, below zero
   low_obstacles  30 square pits of 0.8 m (8 x 8 pixels, may overlap), depth 0.03 d / 0.9 m
 Heights are stored as int16 units (float heights / 5 mm, truncated toward zero, as numpy's int16 assignment does). A tile's
-origin is its centre at the highest point of its central 1 x 1 m. With `np.random.RandomState(seed)` the draws are the ones
-Holosoma makes from the global NumPy generator right after `np.random.seed(seed)`.
+origin, where robots spawn, is its center in x and y, at the height of the highest point in its central 1 x 1 m. With
+`np.random.RandomState(seed)` the draws are the ones Holosoma makes from the global NumPy generator right after
+`np.random.seed(seed)`.
 
-The MuJoCo heightfield built here spaces its samples exactly `horizontal_scale` apart (half-size (n - 1) h / 2); Holosoma's
+The MuJoCo heightfield (scene.py) spaces its samples exactly `horizontal_scale` apart (half-size (n - 1) h / 2); Holosoma's
 MuJoCo backend uses half-size n h / 2, which stretches the physical ground by n / (n - 1) against the mesh its rewards read
-(docs/holosoma_task.md, spec 11). Here physics and height lookups use the same surface: MuJoCo splits
-each heightfield cell along the diagonal from its (low x, low y) to its (high x, high y) corner, as Holosoma's trimesh does,
-and `height` interpolates on exactly those triangles.
+(docs/holosoma_task.md, spec 11). Here physics and height lookups use the same surface: MuJoCo splits each heightfield cell
+along the diagonal from its (low x, low y) to its (high x, high y) corner, as Holosoma's trimesh does, and `height`
+interpolates on exactly those triangles.
 """
 
 from __future__ import annotations
@@ -38,8 +42,8 @@ class TerrainCfg:
 
     @classmethod
     def scaled(cls, factor: float = 1.0, seed: int = 42) -> TerrainCfg:
-        """Holosoma's `scale_factor` (README: 0.5 for PPO on MJWarp): fewer and smaller tiles, a narrower border and a finer
-        height unit; heights in metres keep their distributions, pits shrink with the tile."""
+        """Holosoma's `scale_factor` (its README recommends 0.5 for PPO on MuJoCo Warp): fewer and smaller tiles, a narrower
+        border and a finer height unit; heights in meters keep their distributions, pits shrink with the tile."""
         return cls(num_rows=int(max(1, 10 * factor)), num_cols=int(max(1, 20 * factor)), tile=float(max(1, int(8.0 * factor))),
                    vertical_scale=0.005 * factor, border=40.0 * factor, seed=seed)  # fmt: skip
 
@@ -48,7 +52,7 @@ class TerrainCfg:
 class Terrain:
     cfg: TerrainCfg
     heights: np.ndarray  # int16 [rows (x), cols (y)], units of vertical_scale
-    origins: np.ndarray  # [num_rows, num_cols, 3] tile centres (m), z = max height of the central 1 x 1 m
+    origins: np.ndarray  # [num_rows, num_cols, 3] tile centers (m), z = max height of the central 1 x 1 m
     types: np.ndarray  # [num_rows, num_cols] index into TYPES
     difficulty: np.ndarray  # [num_rows, num_cols]
 
@@ -63,6 +67,8 @@ class Terrain:
 
 
 def generate(cfg: TerrainCfg = TerrainCfg()) -> Terrain:
+    """The terrain of `cfg`: every tile's type and difficulty, drawn in Holosoma's order, and the resulting height map and
+    tile origins."""
     rng = np.random.RandomState(cfg.seed)
     hs, vs = cfg.horizontal_scale, cfg.vertical_scale
     tp = int(cfg.tile / hs)  # pixels per tile side (80)
@@ -74,7 +80,7 @@ def generate(cfg: TerrainCfg = TerrainCfg()) -> Terrain:
     names = [t for t, q in zip(TYPES, cfg.proportions) if q > 0.0]
     p = np.asarray([q for q in cfg.proportions if q > 0.0], np.float64)
     p = p / p.sum()
-    c1, c2 = int((cfg.tile / 2 - 0.5) / hs), int((cfg.tile / 2 + 0.5) / hs)
+    c1, c2 = int((cfg.tile / 2 - 0.5) / hs), int((cfg.tile / 2 + 0.5) / hs)  # the central 1 x 1 m of a tile, in pixels
     for k in range(cfg.num_rows * cfg.num_cols):
         i, j = np.unravel_index(k, (cfg.num_rows, cfg.num_cols))
         kind = rng.choice(names, p=p)
@@ -104,28 +110,11 @@ def sample_env_origins(terrain: Terrain, num_envs: int, rng: np.random.RandomSta
     return terrain.origins[rows, cols]
 
 
-def mujoco_hfield(terrain: Terrain) -> dict:
-    """MjSpec arguments for an hfield whose samples sit exactly `horizontal_scale` apart.
-
-    MuJoCo hfield rows run along y and columns along x, so the (x, y) int16 map is transposed. Returns the hfield fields
-    (nrow, ncol, size, userdata) and the geom position that puts pixel (0, 0) at world (x0, x0).
-    """
-    h = terrain.heights_m
-    lo, hi = float(h.min()), float(h.max())
-    span = max(hi - lo, 1e-6)
-    nx, ny = h.shape
-    hs = terrain.cfg.horizontal_scale
-    rx, ry = (nx - 1) * hs / 2, (ny - 1) * hs / 2
-    data = ((h - lo) / span).T.astype(np.float32)  # [ny (rows), nx (cols)]
-    return {"nrow": ny, "ncol": nx, "size": [rx, ry, span, 0.1], "userdata": data.ravel().tolist(),
-            "pos": [terrain.x0 + rx, terrain.x0 + ry, lo]}  # fmt: skip
-
-
 def height(heights, x0: float, hs: float, x, y):
-    """Terrain height at world (x, y) on MuJoCo's heightfield triangles; heights (nx, ny) in metres, pixel (0, 0) at (x0, x0).
+    """Terrain height at world (x, y) on MuJoCo's heightfield triangles; heights (nx, ny) in meters, pixel (0, 0) at (x0, x0).
 
     Differentiable in x and y (the slope of the triangle) for imagination. Outside the map the edge pixels extend flat."""
-    import jax.numpy as jnp  # the generator and the MuJoCo export work without JAX
+    import jax.numpy as jnp  # the terrain generator works without JAX
 
     nx, ny = heights.shape
     fx, fy = (x - x0) / hs, (y - x0) / hs

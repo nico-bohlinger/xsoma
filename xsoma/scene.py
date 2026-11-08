@@ -1,4 +1,5 @@
-"""The MuJoCo scene of Holosoma's G1 velocity task (upstream 79ba714, `simulator/mujoco/scene_manager.py`).
+"""The MuJoCo scene of Holosoma's G1 velocity task (upstream 79ba714, `simulator/mujoco/scene_manager.py`): the robot on the
+terrain, as the MjModel that the simulator (sim.py) runs. `build` compiles the scene and `spec` returns it before compilation.
 
 Holosoma's MuJoCo backends compile: a world with timestep 0.005 and MuJoCo's default solver options (Euler, Newton, 100
 iterations, 50 line-search iterations, pyramidal cone, tolerance 1e-8); a terrain geom named `floor` (friction
@@ -7,15 +8,18 @@ iterations, 50 line-search iterations, pyramidal cone, tolerance 1e-8); a terrai
 collides with the terrain only. The MJCF's 14 explicit sole pairs (`<pair geom2="floor" solref="0.01 1" friction="0.8 0.8"/>`)
 bind to that floor and carry their own contact parameters.
 
-Here the terrain is one heightfield per tile, centred on its tile, and the flat border four boxes. MuJoCo Warp's heightfield
-collision loses float32 precision with the distance from the heightfield's centre: on Holosoma's single 160 x 240 m field,
-robots on the corner tiles blow up (511 of 512 robots within 20 s under violent random actions, 10 of 512 under normal ones;
-14 and 0 on the central tiles; with one field per tile 12 and 0 on the corner tiles; tools/stress_sim.py) - the failure
-Holosoma's README reports for PPO on MJWarp at full terrain scale. Since the soles then meet many terrain geoms, the explicit pairs become dynamic contacts whose sole geom has priority and
-the pairs' parameters (friction 0.8, solref 0.01 1, MuJoCo's default solimp): the same contacts with the same parameters
+Here the terrain is one heightfield per terrain tile, each centered on its tile, and the flat border is four boxes. The reason
+is that MuJoCo Warp's heightfield collision loses float32 precision with the distance from the heightfield's center. On
+Holosoma's single 160 x 240 m field, robots on the corner tiles blow up: 511 of 512 robots within 20 s under violent random
+actions and 10 of 512 under normal ones, against 14 and 0 on the central tiles. With one field per tile it is 12 and 0 on the
+corner tiles (tools/stress_sim.py). Holosoma's README reports the same failure for PPO on MuJoCo Warp at full terrain scale.
+
+An explicit pair names one terrain geom, and there are now many (one per tile, and the border). So the sole pairs become dynamic
+contacts between the sole geoms and every terrain geom: the sole geom gets priority, so its contacts use the pairs' parameters
+(friction 0.8, solref 0.01 1, MuJoCo's default solimp). These are the same contacts with the same parameters
 (tests/test_scene.py), and friction randomization writes the sole geoms' friction.
 
-Options:
+Options of `build` and `spec`:
   foot      "capsules" (Holosoma's 7 thin capsules per sole) or "box" (RL-X's G1 box foot: half-sizes 0.095 x 0.027 x 0.008
             at (0.04, 0, -0.0274) in the ankle-roll frame, same sole height), with the same contact parameters
   terrain   None for a plane, or a `terrain.Terrain` (heightfield samples exactly one pixel apart)
@@ -35,26 +39,31 @@ import numpy as np
 
 from . import terrain as terrain_mod
 
-# Holosoma's G1 MJCF, unmodified; its visual meshes (assets/meshes, tools/download_meshes.sh) are only loaded with visual=True
+# Holosoma's G1 MJCF, unmodified; the environment variable XSOMA_G1_XML overrides the path. Its visual meshes (assets/meshes,
+# tools/download_meshes.sh) are only loaded with visual=True.
 G1_XML = os.environ.get("XSOMA_G1_XML") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "g1_29dof.xml")
 
-FLOOR = {"friction": [0.7, 0.005, 0.001], "solimp": [0.99, 0.99, 0.01, 0.5, 2], "solref": [0.001, 1]}
+FLOOR = {"friction": [0.7, 0.005, 0.001], "solimp": [0.99, 0.99, 0.01, 0.5, 2], "solref": [0.001, 1]}  # Holosoma's terrain geom
+# Holosoma's explicit sole-floor pairs; friction is (sliding twice, torsional, rolling twice), as in MuJoCo's <pair>
 PAIR = {"friction": [0.8, 0.8, 0.005, 0.0001, 0.0001], "solref": [0.01, 1], "solimp": [0.9, 0.95, 0.001, 0.5, 2], "condim": 3}
-BOX_FOOT = {"size": [0.095, 0.027, 0.008], "pos": [0.04, 0.0, -0.0274]}
+BOX_FOOT = {"size": [0.095, 0.027, 0.008], "pos": [0.04, 0.0, -0.0274]}  # half-sizes, and position in the ankle-roll frame
 BASE = 0.1  # heightfield depth below its lowest sample
 
 
 def _hfield(world, name, heights, x0, y0, hs):
-    """A heightfield geom whose samples (nx, ny), heights in metres, sit hs apart starting at world (x0, y0)."""
+    """A heightfield geom whose samples (nx, ny), heights in meters, sit hs apart starting at world (x0, y0)."""
     nx, ny = heights.shape
     lo, hi = float(heights.min()), float(heights.max())
     span = max(hi - lo, 1e-6)
     rx, ry = (nx - 1) * hs / 2, (ny - 1) * hs / 2
+    # MuJoCo's size is (x radius, y radius, elevation range, base depth); the elevations are stored in [0, 1], rows along y
     world.add_hfield(name=name, nrow=ny, ncol=nx, size=[rx, ry, span, BASE], userdata=((heights - lo) / span).T.astype(np.float32).ravel().tolist())
     return world.worldbody.add_geom(name=name, type=mujoco.mjtGeom.mjGEOM_HFIELD, hfieldname=name, pos=[x0 + rx, y0 + ry, lo])
 
 
 def _terrain_geoms(world, terrain: terrain_mod.Terrain, tiles: bool):
+    """The terrain geoms: with `tiles`, one heightfield per terrain tile and four flat border boxes; otherwise one heightfield
+    for the whole terrain."""
     cfg, h = terrain.cfg, terrain.heights_m
     hs, x0 = cfg.horizontal_scale, terrain.x0
     if not tiles:
@@ -78,12 +87,13 @@ def _terrain_geoms(world, terrain: terrain_mod.Terrain, tiles: bool):
 
 def build(foot: str = "capsules", terrain: terrain_mod.Terrain | None = None, tiles: bool = True, pairs: bool = False, visual: bool = False,
           sensors: bool = False, iterations: int = 100, ls_iterations: int = 50, ccd_tolerance: float = 1e-6, xml: str = G1_XML) -> mujoco.MjModel:  # fmt: skip
+    """Compile the scene of `spec`, which takes the same options."""
     return spec(foot, terrain, tiles, pairs, visual, sensors, iterations, ls_iterations, ccd_tolerance, xml).compile()
 
 
 def spec(foot: str = "capsules", terrain: terrain_mod.Terrain | None = None, tiles: bool = True, pairs: bool = False, visual: bool = False,
          sensors: bool = False, iterations: int = 100, ls_iterations: int = 50, ccd_tolerance: float = 1e-6, xml: str = G1_XML) -> mujoco.MjSpec:  # fmt: skip
-    """The scene before compilation (build's options), e.g. to restyle it for rendering."""
+    """The scene before compilation (with build's options), for example to restyle it for rendering."""
     world = mujoco.MjSpec()
     world.copy_during_attach = True
     world.option.timestep = 0.005
@@ -100,7 +110,7 @@ def spec(foot: str = "capsules", terrain: terrain_mod.Terrain | None = None, til
     assert not pairs or len(floors) == 1, "explicit pairs bind to a single terrain geom"
 
     robot = mujoco.MjSpec.from_file(xml)
-    if not visual:
+    if not visual:  # drop the visual-only geoms (they never collide) and the meshes
         for g in [g for g in robot.geoms if g.contype == 0 and g.conaffinity == 0]:
             robot.delete(g)
         for m in list(robot.meshes):
@@ -108,7 +118,7 @@ def spec(foot: str = "capsules", terrain: terrain_mod.Terrain | None = None, til
     if not sensors:
         for s in list(robot.sensors):
             robot.delete(s)
-    if foot == "box":
+    if foot == "box":  # replace the capsule soles and their pairs by one box per foot
         for p in list(robot.pairs):
             robot.delete(p)
         for g in [g for g in robot.geoms if "foot" in g.name and g.name.endswith("_collision")]:
@@ -126,10 +136,12 @@ def spec(foot: str = "capsules", terrain: terrain_mod.Terrain | None = None, til
             robot.delete(p)
         for g in robot.geoms:
             if g.name in soles:
-                g.priority, g.condim = 1, PAIR["condim"]
-                g.friction = [PAIR["friction"][0], PAIR["friction"][2], PAIR["friction"][3]]
+                g.priority, g.condim = 1, PAIR["condim"]  # priority makes MuJoCo use this geom's parameters in its contacts
+                g.friction = [PAIR["friction"][0], PAIR["friction"][2], PAIR["friction"][3]]  # (sliding, torsional, rolling)
                 g.solref, g.solimp = PAIR["solref"], PAIR["solimp"]
-    for g in robot.geoms:  # Holosoma's self-collision switch: robot geoms collide with the terrain only
+    # Holosoma's self-collision switch: robot geoms (contype 1) get conaffinity 2, so they hit the terrain (contype 2,
+    # conaffinity 1) but not each other
+    for g in robot.geoms:
         if g.contype == 1 and g.conaffinity == 1:
             g.conaffinity = 2
     world.attach(robot, frame=world.worldbody.add_frame(), prefix="robot_")

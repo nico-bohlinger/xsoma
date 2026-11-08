@@ -1,10 +1,9 @@
 # XSoma
 
-**Humanoid velocity tracking on rough terrain in about three minutes on one GPU.** XSoma trains the Unitree G1 task of
-[Holosoma](https://github.com/amazon-far/holosoma) (its rewards, terminations, commands, randomization and terrain, checked
-against Holosoma's own code) with a learned world model and backpropagation through imagined rollouts, all in JAX. On one
-H100 it passes Holosoma's own tracking bar 3.2 minutes after launch, 3.3× sooner than Holosoma's FastSAC, and ends with a
-38 % lower velocity error; Holosoma's PPO does not pass the bar within an hour.
+**Humanoid velocity tracking on rough terrain, learned in under three minutes on one GPU.** XSoma trains the Unitree G1
+task of [Holosoma](https://github.com/amazon-far/holosoma) with a learned world model: the policy improves by
+backpropagating Holosoma's own reward through motions it imagines. On one H100 it reaches Holosoma's own tracking bar
+after 2.6 minutes of training, 3.7× sooner than Holosoma's FastSAC. Holosoma's PPO does not reach it within an hour.
 
 Paper: [Learning Humanoid Motion Tracking and Locomotion in Minutes Through Imagination](https://nico-bohlinger.github.io/papers/2026_xmimic_xsoma.pdf)
 (Nico Bohlinger, Jan Peters, 2026), which presents XSoma together with [XMimic](https://github.com/nico-bohlinger/xmimic).
@@ -12,216 +11,203 @@ Please [cite it](#citation) if you use XSoma.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="figures/time_to_target_dark.png">
-  <img alt="Time to Holosoma's FastSAC tracking bar on one H100: XSoma 3.2 min, Holosoma FastSAC 10.6 min, Holosoma PPO not reached in 60 min" src="figures/time_to_target.png">
+  <img alt="Training time to Holosoma's FastSAC tracking bar on one H100: XSoma 2.6 min, Holosoma FastSAC 9.7 min, Holosoma PPO not reached in 60 min" src="figures/time_to_target.png">
 </picture>
 
 ## What XSoma is
 
-[Holosoma](https://github.com/amazon-far/holosoma) (Amazon FAR) trains a G1 to follow velocity commands (forward, sideways,
-turning) on randomized rough terrain with PPO or FastSAC. XSoma keeps Holosoma's task and replaces the learner:
+[Holosoma](https://github.com/amazon-far/holosoma) (Amazon FAR) trains a G1 to follow velocity commands, walking forward,
+sideways and turning, on randomized rough terrain with PPO or FastSAC. XSoma keeps Holosoma's task and replaces the
+learner.
 
-- **The task, reimplemented and checked.** [`xsoma/task.py`](xsoma/task.py) and [`xsoma/sim.py`](xsoma/sim.py) are Holosoma's
-  `g1_29dof` task as JAX functions, simulated with MuJoCo Warp through MJX, with Holosoma's MJCF and solver settings. Against
-  Holosoma's own environment ([`tests/test_task_holosoma.py`](tests/test_task_holosoma.py): 1500 recorded steps with pushes,
-  command changes, a time-out and falls), every observation matches to 1.4·10⁻⁶, every reward term to float32 precision,
-  and terminations, gait clock, curriculum, delays, torques and resets exactly. [`docs/holosoma_task.md`](docs/holosoma_task.md)
-  cites Holosoma's source for every number.
-- **The learner.** XSoma learns a world model of the robot from replayed transitions and improves the policy by
-  backpropagating Holosoma's reward through 48 imagined steps (about one second), the recipe of SuperMimic and
-  [XMimic](https://github.com/nico-bohlinger/xmimic). Imagination does not need a learned reward or critic: the task's own
-  observation, reward and termination functions run on the imagined states, with forward kinematics and an exact lookup of
-  the terrain under every foot.
-- **One GPU, compiled.** Collection, world-model fits and policy updates are three XLA programs, compiled in parallel
-  before training starts (about 70 s, or 20 to 40 s from the compilation cache).
+- **The same task.** Holosoma's rewards, terminations, commands, randomization, pushes and terrain, rewritten in JAX and
+  checked step by step against Holosoma's own environment ([`tests/test_task_holosoma.py`](tests/test_task_holosoma.py)).
+  The policy has Holosoma's observations and actions and the layer sizes of its PPO policy.
+- **Learning through imagination.** XSoma learns a world model that predicts how the robot moves. The policy imagines its
+  next second of motion in that model and improves by backpropagating Holosoma's reward through it. This is the recipe of
+  SuperMimic and [XMimic](https://github.com/nico-bohlinger/xmimic).
+- **Everything on the GPU.** The simulator (MuJoCo Warp), the world model and the policy run in JAX as compiled programs,
+  so the GPU hardly ever waits for Python.
 
-<p align="center"><img src="figures/xsoma.gif" width="720" alt="XSoma: 3.3x faster than FastSAC to Holosoma's tracking bar, with the G1 walking over rough ground and pits"></p>
-<p align="center"><sub>The G1 driven by an XSoma policy 2.7 minutes after launch on one H100 (seed 0's target checkpoint), walking
-over rough ground and a field of pits on Holosoma's terrain, replayed in MuJoCo.</sub></p>
+<p align="center"><img src="figures/xsoma.gif" width="720" alt="The G1 walking over rough ground and pits under an XSoma policy, following a sequence of velocity commands"></p>
+<p align="center"><sub>The G1 driven by an XSoma policy after 14 minutes of training on one H100, following a smooth sequence
+of velocity commands over Holosoma's rough ground and pits, replayed in MuJoCo.</sub></p>
 
 ## Results
 
-Every method on one H100, from launch, on Holosoma's task at terrain scale 0.5 (the setting Holosoma's README uses for
-MJWarp), evaluated the same way:
+Every method trains on one H100 on Holosoma's task, on the half-size terrain that Holosoma recommends for its MuJoCo Warp
+backend, and every checkpoint is evaluated the same way.
 
-| method | runs | time to target (min) | speedup | env steps to target | after 20 min: velocity error, falls | at the end: velocity error, falls |
-|---|---|---|---|---|---|---|
-| XSoma | 5 | 3.2 (2.7–3.9) | 3.3× | 5 M | 0.33 m/s, 0.6 % | 0.29 m/s, 0.2 % (61 min) |
-| Holosoma FastSAC | 4 | 10.6 (9.5–11.7) | 1.0× | 41 M | 0.48 m/s, 0.2 % | 0.47 m/s, 0.2 % (50 min) |
-| Holosoma PPO | 4 | not within 60 | – | – | 0.72 m/s, 58.7 % | 0.64 m/s, 38.0 % (59 min) |
+| method | runs | time to target (min) | speedup | env steps to target | after 15 min: velocity error, falls |
+|---|---|---|---|---|---|
+| XSoma | 5 | **2.6** (2.2–3.2) | **3.7×** | 5 M | 0.33 m/s, 0.5 % |
+| Holosoma FastSAC | 4 | 9.7 (8.6–10.6) | 1.0× | 41 M | 0.49 m/s, 0.4 % |
+| Holosoma PPO | 4 | not within 60 | – | – | 0.64 m/s, 10.7 % |
 
-- **The target** is Holosoma's own bar for its FastSAC preset: its nightly test passes when the velocity-tracking term
-  `Episode/rew_tracking_lin_vel` reaches 0.95 and the yaw-rate term 0.8. Here both are measured on deterministic evaluation
-  episodes and must hold for three consecutive checkpoints.
-- **Evaluation.** Every checkpoint drives 2048 robots for one 20-s episode each, with the policy's mean action, Holosoma's
-  randomization, pushes and command sampling, on the same terrain and the same episodes for every method. Holosoma's
-  checkpoints are converted to plain arrays and run in the same simulator.
-- **Time** is wall-clock time since launch, including start-up and compilation.
-- **Fewer simulated steps.** XSoma collects 28,000 env steps per second and spends the rest of each iteration learning;
-  FastSAC collects 71,000 and PPO 100,000. XSoma reaches the target after 5 million env steps, FastSAC after 41 million.
+Times are means over runs (range in brackets), in minutes of training with start-up and compilation excluded.
+
+- **The target** is Holosoma's own bar for FastSAC, from its nightly test: a velocity-tracking score of at least 0.95 and a
+  yaw-rate score of at least 0.8 in Holosoma's metrics. Here it has to hold for three checkpoints in a row.
+- **Better tracking, not only sooner.** After 15 minutes, XSoma's velocity error is a third lower than FastSAC's. FastSAC
+  does not get there even at the end of its 50-minute schedule (0.47 m/s).
+- **Far fewer simulated steps.** XSoma spends most of its time learning rather than simulating. It reaches the target after
+  5 million environment steps, FastSAC after 41 million.
+- **PPO** comes closest after about 12 minutes. Then its penalty curriculum, which raises the penalties once the robot stays
+  upright, pulls its tracking down for the rest of the hour.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="figures/learning_curves_dark.png">
-  <img alt="Learning curves over 60 minutes: XSoma's velocity tracking rises and its velocity error falls fastest and end best, FastSAC plateaus, PPO drops after 12 minutes" src="figures/learning_curves.png">
+  <img alt="Learning curves over 15 minutes of training: XSoma's velocity tracking rises first and its velocity error ends lowest, FastSAC follows, PPO stays behind" src="figures/learning_curves.png">
 </picture>
 
-## What we found on the way
+<details>
+<summary><b>How we measured</b></summary>
 
-These concern anyone training on MuJoCo Warp (MJWarp) or with Holosoma's MuJoCo model, with or without XSoma:
+<br>
 
-1. **MuJoCo Warp's heightfield collision breaks down far from the field's centre.** Holosoma's MuJoCo backends build the
-   whole terrain as one heightfield (160 × 240 m at full scale). In float32, robots far from its centre blow up: under
-   violent random actions, 511 of 512 robots on the corner tiles reach non-finite or impossible velocities within 20 s,
-   against 14 on the central tiles, and under normal actions 10 of 512 on the corner tiles and none in the centre
-   ([`tools/stress_sim.py`](tools/stress_sim.py)). This matches the failure Holosoma's README reports for PPO on MJWarp at
-   full terrain scale (we saw it crash in its first rollout), and why it recommends half scale there. XSoma builds one
-   heightfield per tile (plus four boxes for the flat border): the same surface, and the corner tiles become as stable as
-   the central ones (12 of 512 robots under violent actions, none under normal ones). With it XSoma also trains at full
-   scale.
-2. **Explicit contact pairs ignore friction randomization.** The G1 MJCF binds its 14 sole capsules to the floor with
-   explicit `<pair>`s, which carry their own friction (0.8). Holosoma's MuJoCo backends randomize `geom_friction`, which
-   pairs never read, so the feet always have friction 0.8 there. XSoma turns the pairs into priority contacts with the same
-   parameters (identical contacts and solver output, [`tests/test_scene.py`](tests/test_scene.py)), so that the soles'
-   friction can be randomized as Holosoma intends.
-3. **Two smaller differences between the MuJoCo path and the config.** The hip-roll motors are clamped at 88 N·m by the
-   MJCF's `ctrlrange` (the config says 139). The heightfield is stretched by n/(n−1) against the mesh the foot-height
-   reward reads, a centimetre-level misalignment; XSoma's physics and rewards use one surface.
+- **Hardware.** One H100 (95 GB) per run, four runs per node, all on the same cluster.
+- **Baselines.** Holosoma at commit `79ba714`, presets `g1_29dof_fast_sac` and `g1_29dof`, unmodified, on its MuJoCo Warp
+  backend at terrain scale 0.5 with 4096 robots ([`tools/run_holosoma.sh`](tools/run_holosoma.sh)). FastSAC ran its whole
+  schedule (50,000 iterations, about 50 minutes) and PPO one hour of its 25,000 iterations (about 7 hours at this speed).
+- **Evaluation.** Every checkpoint of every method drives 2048 robots for one 20-s episode each, with the policy's mean
+  action and Holosoma's randomization, pushes and commands, on the same terrain and the same episodes
+  ([`xsoma/evaluate.py`](xsoma/evaluate.py)). Holosoma's checkpoints are converted to plain arrays
+  ([`tools/holosoma_ckpt.py`](tools/holosoma_ckpt.py)) and run in XSoma's simulator. Holosoma's own logged metrics come
+  from its noisy training episodes and are lower.
+- **Training time.** XSoma compiles before its clock starts. Holosoma compiles inside its training loop, so the extra time
+  of its first logged interval (about 12 s for FastSAC, 0.3 s for PPO) is subtracted from its checkpoint times, as XMimic
+  does for BlinkMimic ([`results/README.md`](results/README.md)).
+- **Checkpoints.** XSoma and FastSAC save one about every minute of training and PPO about every 1.7 minutes, so the times
+  to the target come in steps of about a minute. Three of the five XSoma runs pass at their second checkpoint, two at
+  their third.
+- **Data.** Every number and figure comes from the files in [`results/`](results/), through
+  [`tools/make_figures.py`](tools/make_figures.py). The published runs trained for 60 minutes, and the figures show their
+  first 15.
+
+</details>
 
 ## How it works
 
-An iteration takes about 147 ms on an H100:
+Every iteration does three things, about seven times per second on an H100.
 
-1. **Collect** one step of 4096 robots into a replay buffer that holds the last 200 steps (0.8 M transitions): half of
-   them act with the policy's action, the other half add Gaussian exploration noise.
-2. **Fit the world model** three times on 8-step windows of real transitions, open loop. It is an MLP (3 × 512) that
-   predicts the robot's next state (pelvis pose and velocity, joint positions and velocities) from the current one, the
-   PD error of the joint targets, the terrain under the robot (pelvis height and the clearance of 28 points on the soles)
-   and the robot's randomized dynamics (PD gains, masses, friction: 72 numbers).
-3. **Update the policy** twice: from 2048 replayed states, roll the policy out 48 steps (one second) in the world model and
-   ascend the discounted sum of Holosoma's rewards along it. Every imagined state goes through Holosoma's own reward and
-   termination functions, so their gradients reach the policy through the world model. A fall (a termination body below
-   the terrain) ends an imagined rollout; its gradient comes from a sigmoid of the clearance.
-
-The policy network, its inputs and its outputs are Holosoma's (the 100-number actor observation in, joint targets out), so
-an XSoma policy runs wherever a Holosoma policy runs. The evaluated policy is an average of recent policies.
+1. **Collect.** 4096 simulated robots take one step each, and the steps go into a replay buffer. Half of the robots add
+   exploration noise to the policy's action, the other half act without it.
+2. **Learn the world model.** A small network learns to predict the robot's next state from its current state, its action,
+   the terrain under its feet and its randomized dynamics, by predicting 8 recorded steps at a time.
+3. **Learn the policy, twice.** Starting from recorded states, the policy imagines its next 48 steps, about one second,
+   with the world model. Holosoma's own reward and termination functions score every imagined step, with the exact height
+   of the terrain under the feet, and the policy follows the gradient of that score back through the imagined motion.
 
 What mattered most:
 
-- **More policy updates per environment step.** A policy update costs about 49 ms on an H100, one step of 4096 robots
-  plus the world-model fits about as much. Two updates per step learn fastest in wall-clock time: five minutes after
-  launch the velocity error is 0.34 to 0.36 m/s, against 0.45 to 0.49 with one update per one or two steps, and one update
-  per four steps collapsed in 2 of 4 runs. Three or four updates per step reach the target at the same time as two.
-- **Holosoma's FastSAC reward preset.** The two presets differ only in the reward for staying alive (10 vs 1 per second).
-  Within a one-second horizon, PPO's 1 hardly outweighs the tracking terms, and XSoma learns to balance much later. All
-  methods are scored on the same tracking terms.
-- **No critic.** Bootstrapping the return with a learned value function made tracking slower (Holosoma's tracking metric
-  0.79 against 1.31 after 17 minutes); the exact one-second return is enough here.
-- **Some robots collect without exploration noise.** When every collected action is noisy, the policy comes to rely on the
-  noise: after about 45 minutes of training, its noise-free actions let the robot sink into a crouch within seconds of
-  some commands, and by 60 minutes 32 to 61 % of the evaluation episodes end in a fall, while the noisy training episodes
-  still look fine. Letting half of the robots act with the policy's mean action puts that behaviour into the world
-  model's data: every run stays stable through the hour (at most 0.3 % falls at the last checkpoint), and early learning gets
-  faster too. Half works better than a quarter (target at 3.2 against 3.8 minutes, 5 runs each) and than halving the noise
-  of every robot (3.7 minutes, 2 runs), which also keep the runs stable.
+- **Holosoma's exact reward in imagination.** With the true reward and terrain at every imagined step, one second of
+  imagination is enough. XSoma needs no learned reward and no critic, and a critic made tracking slower.
+- **Two policy updates per simulated step.** Learning more from every collected step pays off in wall-clock time. Fewer
+  updates learned slower and collapsed in some runs.
+- **Half of the robots without noise.** When every collected action is noisy, the policy comes to rely on the noise and,
+  after about 45 minutes of training, fails without it. Noise-free data keeps every run stable and also reaches the target
+  sooner: 2.6 minutes, against 3.2 with a quarter of the robots noise-free and 3.3 with none.
+- **Holosoma's FastSAC reward preset.** It rewards staying upright ten times more than the PPO preset, which matters when
+  the policy looks only one second ahead. Both presets score tracking the same way.
 
-## How it gets fast
+Why it is fast:
 
-- **Three compiled programs.** Collection, world-model fits and policy updates are XLA programs with donated buffers; the
-  host only dispatches them and fetches statistics every 50 iterations. They compile in parallel threads before training
-  (about 70 s, or 20 to 40 s when the persistent cache has them). The MuJoCo model and the terrain are program arguments, so
-  every seed reuses the cached programs.
-- **The simulator stays on the GPU.** MuJoCo Warp through MJX runs Holosoma's whole task step (four 5-ms physics substeps
-  with the PD law, terminations, rewards, resets, pushes, observations) at 250,000 env steps per second on an H100
-  ([`tools/bench_sim.py`](tools/bench_sim.py)). The contact-force termination is decoded from MuJoCo
-  Warp's contact pool, so no extra pass computes contact sensors.
-- **bf16 where PyTorch would use it.** Matmuls in imagination output bf16, so their backward passes run on bf16 tensor
-  cores; cuBLAS replaces XLA's Triton GEMMs, which are slower for these sizes on Hopper.
-- **The task once, for both.** The simulator and imagination call the same JAX functions for kinematics, terrain heights,
-  observations, rewards and terminations ([`tools/check_heads.py`](tools/check_heads.py) checks that imagination's rewards
-  equal the simulator's on real transitions).
+- **The simulator stays on the GPU.** MuJoCo Warp runs Holosoma's whole task step, with physics, rewards, resets and
+  pushes, at 250,000 robot steps per second on an H100 ([`tools/bench_sim.py`](tools/bench_sim.py)).
+- **Three compiled programs.** Collection, world-model learning and policy learning are compiled XLA programs. Python only
+  starts them and reads the logs every 50 iterations.
+- **One task, two uses.** The simulator and the imagination call the same JAX functions for kinematics, terrain heights,
+  observations, rewards and terminations ([`tools/check_heads.py`](tools/check_heads.py) checks that both give the same
+  rewards).
 
 <details>
 <summary><b>What did not help</b></summary>
 
 <br>
 
-- A critic: as a bootstrap at the horizon or as λ-returns, it slowed tracking or destabilized training.
-- Fewer policy updates per environment step: slower in wall-clock time and less stable (see above).
-- A left-right symmetry loss (Holosoma's PPO uses one), an extra survival bonus in imagination, lagging the penalty
-  curriculum in imagination, clipping exploding trajectories' gradients, rejecting policy steps that lowered the imagined
-  return, a decaying learning rate, collecting with the averaged policy: within noise or worse.
-- Holosoma's pushes inside imagination (1 or 3 % of imagined steps), against the remaining falls, which all come 0.5 to 2 s
-  after a push: no fewer falls, and slower tracking.
-- A shorter horizon (32 steps, 0.64 s): faster updates, but the policy did not learn to avoid falls.
-- Smaller imagined batches (1024): barely faster per update (the update is bound by kernel latency, not arithmetic) and a
-  temporary collapse in one run. Larger ones (4096): slower per update, no faster learning.
-- Longer unrolling of the imagination loop than 4: no faster, much longer compilation.
+- A critic, as a bootstrap at the horizon or as λ-returns: slower tracking or unstable training.
+- Fewer policy updates per simulated step: slower in wall-clock time and less stable.
+- More robots without noise (three quarters): slower on average, and one of four runs collapsed after 12 minutes.
+- Holosoma's pushes inside imagination: no fewer falls, and slower tracking.
+- A shorter horizon (0.64 s): the policy did not learn to avoid falls.
+- A left-right symmetry loss, a survival bonus in imagination, clipping the gradients of exploding imagined motions,
+  rejecting updates that lowered the imagined return, a decaying learning rate, collecting with the averaged policy, larger
+  or smaller imagined batches, and longer unrolling of the imagination loop: within noise or worse.
 
 </details>
+
+## What we found on the way
+
+These matter for anyone who trains on MuJoCo Warp or with Holosoma's MuJoCo model, with or without XSoma.
+
+1. **MuJoCo Warp's height-map collision breaks down far from the map's center.** Holosoma builds its whole terrain as one
+   height map (160 × 240 m at full size). In float32, robots on the outer tiles reach invalid states
+   ([`tools/stress_sim.py`](tools/stress_sim.py)), which matches the failure Holosoma's README reports for PPO on MuJoCo Warp
+   at full terrain size. XSoma builds one height map per tile, which describes the same surface and is stable everywhere.
+2. **Explicit contact pairs ignore friction randomization.** The G1 model binds its sole capsules to the floor with explicit
+   contact pairs, which carry their own friction, so randomizing the friction of the geoms leaves the feet at 0.8. XSoma
+   turns the pairs into priority contacts with the same parameters, so the soles' friction is randomized as Holosoma
+   intends ([`tests/test_scene.py`](tests/test_scene.py)).
+3. **Two small mismatches.** The model limits the hip-roll motors to 88 N·m, where Holosoma's config says 139, and the
+   height map is stretched by n/(n−1) against the mesh that the foot-height reward reads. XSoma's physics and rewards use
+   one surface.
 
 ## How to run
 
 Linux with an NVIDIA GPU and CUDA 12, Python 3.11. The published numbers are from H100s.
-Warp's wheel on PyPI needs an NVIDIA driver of version 580 or newer; with an older driver, install Warp's CUDA 12 build
+Warp's wheel on PyPI needs an NVIDIA driver of version 580 or newer. With an older driver, install Warp's CUDA 12 build
 (`warp_lang-1.19.0+cu12`) from [its releases](https://github.com/NVIDIA/warp/releases) instead.
 
 ```bash
 pip install -r requirements.txt
-python train.py --log_dir runs/xsoma        # 20 minutes of training (the published runs: --minutes 60), then every
-                                            # checkpoint is evaluated into runs/xsoma/eval.jsonl
+python train.py --log_dir runs/xsoma        # 15 minutes of training, then every checkpoint is evaluated
 ```
 
-The defaults are the published configuration; [`xsoma/train.py`](xsoma/train.py) lists every option. Evaluate any run or
-checkpoint, XSoma's or Holosoma's:
+The defaults are the published configuration, and [`xsoma/train.py`](xsoma/train.py) lists every option. Evaluate any run
+or checkpoint, XSoma's or Holosoma's:
 
 ```bash
 python -m xsoma.evaluate runs/xsoma         # 2048 robots, one 20-s episode each, per checkpoint
 ```
 
-Holosoma's baselines, in Holosoma's own environment (its MJWarp setup):
+Holosoma's baselines, in Holosoma's own environment (its MuJoCo Warp setup), for 15 minutes of training plus start-up:
 
 ```bash
-HOLOSOMA=~/holosoma bash tools/run_holosoma.sh runs/fast_sac 60 g1-29dof-fast-sac
-HOLOSOMA=~/holosoma bash tools/run_holosoma.sh runs/ppo 60 g1-29dof --training.seed=1
+HOLOSOMA=~/holosoma bash tools/run_holosoma.sh runs/fast_sac 17 g1-29dof-fast-sac
+HOLOSOMA=~/holosoma bash tools/run_holosoma.sh runs/ppo 17 g1-29dof --training.seed=1
 python tools/holosoma_ckpt.py runs/ppo/hs/*/*/model_*.pt    # their checkpoints as plain arrays (needs torch)
 python -m xsoma.evaluate runs/ppo                            # back in XSoma's environment
 ```
 
-Checks and figures:
+Checks, figures and the GIF:
 
 ```bash
-JAX_PLATFORMS=cpu python tests/test_task_holosoma.py   # XSoma's task vs Holosoma's environment (recorded in tests/data)
-JAX_PLATFORMS=cpu python tests/test_scene.py           # priority contacts vs explicit pairs, tiles vs one heightfield
-python tools/check_sim.py                              # kinematics, terrain heights, contact forces vs MuJoCo (GPU)
-python tools/check_heads.py                            # imagination's reward and termination vs the simulator's (GPU)
+JAX_PLATFORMS=cpu python tests/test_task_holosoma.py   # XSoma's task against Holosoma's environment (recorded in tests/data)
+JAX_PLATFORMS=cpu python tests/test_scene.py           # priority contacts against explicit pairs, tiles against one height map
+python tools/check_sim.py                              # kinematics, terrain heights and contact forces against MuJoCo (GPU)
+python tools/check_heads.py                            # imagination's rewards and terminations against the simulator's (GPU)
 python tools/stress_sim.py                             # physics failures under hard random actions, per terrain layout (GPU)
-python tools/bench_sim.py                              # simulator throughput (GPU)
+python tools/bench_sim.py                              # simulator speed (GPU)
 python tools/make_figures.py                           # the figures and the table above, from results/
-bash tools/download_meshes.sh && python tools/rollout.py ckpt=runs/xsoma/ckpt/0019.npz && python tools/render_gif.py rollout.npz
+bash tools/download_meshes.sh && python tools/rollout.py ckpt=$(ls runs/xsoma/ckpt/*.npz | tail -1) && python tools/render_gif.py rollout.npz
 ```
 
-## Faithfulness and caveats
+<details>
+<summary><b>Faithfulness and caveats</b></summary>
 
-- **Which Holosoma.** Holosoma's presets default to Isaac Sim; XSoma reproduces Holosoma on MuJoCo (its MJCF, solver
-  settings and MuJoCo backends), and both baselines ran Holosoma's MJWarp backend at terrain scale 0.5, as its README
-  recommends for MJWarp. Isaac Sim differs in contact model, friction and actuator limits.
-- **Where XSoma's simulator differs from Holosoma's MJWarp** (see [What we found on the way](#what-we-found-on-the-way)):
-  one heightfield per tile instead of one for the whole terrain, no n/(n−1) stretch, and in training the soles' friction is
-  randomized as Holosoma's config intends (Holosoma's MJWarp keeps it at 0.8). Evaluation keeps the soles at 0.8 for every
-  method, the setting both baselines trained in. A step that times out and ends in a fall counts as a fall.
-- **One evaluation for all.** Every checkpoint of every method is scored by the same evaluator in XSoma's simulator, on the
-  same 2048 episodes. Holosoma's own logged metrics come from its noisy training episodes and are lower.
-- **Wall-clock time from launch**, start-up and compilation included: XSoma 27 to 42 s with its compilation cache (about
-  70 s without), Holosoma 16 to 60 s (Warp kernel and Inductor caches warm). Every run had a GPU of its own; four runs shared a
-  node.
-- **Budgets.** FastSAC ran its whole schedule (50,000 iterations, about 49 minutes). Holosoma's PPO preset trains 25,000
-  iterations (about 7 hours at this speed); it ran for one hour here. PPO peaks after about 12 minutes. Then its penalty
-  curriculum, which scales all penalty terms up while episodes are long, raises their weight from about 0.05 to 1, and in
-  every run its tracking and its share of upright episodes drop for the rest of the hour.
-- **Falls.** After 20 minutes 0.6 % of XSoma's evaluation episodes end in a fall, against 0.2 % for FastSAC; at the end of
-  training both are at 0.2 %. Earlier XSoma runs fell mostly 0.5 to 2 s after one of Holosoma's pushes.
-- **Seeds and checkpoints.** XSoma and FastSAC save a checkpoint about once a minute, PPO every 1.7 minutes, so times to
-  the target come in steps of a minute: three of the five XSoma runs pass at their second checkpoint (2.7 min), two at
-  their third (3.9 min). Compare means; XSoma has 5 runs, FastSAC and PPO 4 each.
+<br>
+
+- **Which Holosoma.** Holosoma's presets default to Isaac Sim. XSoma reproduces Holosoma on MuJoCo (its MJCF, solver
+  settings and MuJoCo backends), and both baselines ran Holosoma's MuJoCo Warp backend. Isaac Sim differs in its contact
+  model, friction and actuator limits.
+- **Where XSoma's simulator differs from Holosoma's MuJoCo Warp backend** (see [What we found on the way](#what-we-found-on-the-way)):
+  one height map per tile instead of one for the whole terrain, no n/(n−1) stretch, and in training the soles' friction is
+  randomized as Holosoma's config intends. Evaluation keeps the soles at 0.8 for every method, the setting both baselines
+  trained in.
+- **Falls.** After 15 minutes, 0.5 % of XSoma's evaluation episodes end in a fall, against 0.4 % for FastSAC. In earlier
+  runs, most of XSoma's falls came 0.5 to 2 s after one of Holosoma's pushes.
+
+</details>
 
 ## Repository
 
@@ -242,7 +228,7 @@ tests/             equivalence tests against Holosoma and MuJoCo (CPU)
 ## Acknowledgements
 
 - **[Holosoma](https://github.com/amazon-far/holosoma)** (Amazon FAR): the task, the robot model and both baselines that
-  XSoma reimplements and compares against; its FastSAC recipe is described in *Learning Sim-to-Real Humanoid Locomotion in
+  XSoma reimplements and compares against. Its FastSAC recipe is described in *Learning Sim-to-Real Humanoid Locomotion in
   15 Minutes* (Seo et al., [arXiv:2512.01996](https://arxiv.org/abs/2512.01996)).
 - **[XMimic](https://github.com/nico-bohlinger/xmimic)**, and through it [BlinkMimic](https://github.com/fuyichen0725/blinkmimic)
   by Fuyi Chen, [InstantTrack](https://github.com/Huy-Quang-Dao/instantTrack) by Huy-Quang-Dao and
@@ -274,5 +260,5 @@ XSoma learns Holosoma's task with SuperMimic's method, so please also cite them 
 ## License
 
 XSoma is released under the [MIT License](LICENSE). The parts derived from Holosoma (the task reimplementation and the
-bundled G1 MJCF) are under the Apache License 2.0, and the G1 model derives from Unitree's BSD-3-Clause description; see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+bundled G1 MJCF) are under the Apache License 2.0, and the G1 model derives from Unitree's BSD-3-Clause description
+(see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).

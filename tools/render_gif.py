@@ -1,12 +1,13 @@
 """Render the release GIF: the G1 walking on Holosoma's terrain under an XSoma policy, next to the headline result.
 
-    bash tools/download_meshes.sh                                         # the G1's visual meshes, once
-    python tools/rollout.py ckpt=<ckpt>.npz out=rollout.npz tile=2,4      # on a GPU machine
-    python tools/render_gif.py rollout.npz                                # -> figures/xsoma.gif
+    bash tools/download_meshes.sh                                                       # the G1's visual meshes, once
+    python tools/rollout.py ckpt=<ckpt>.npz plan=tour ramp=0.8 pushes=0 tile=1,4        # on a GPU machine
+    python tools/render_gif.py rollout.npz --env 8 --start 3                            # -> figures/xsoma.gif
 
-The numbers on the GIF come from results/ (tools/make_figures.py), not from arguments. The camera follows the robot; the
-command plan of tools/rollout.py (walk, turn, sidestep, walk backward, stand) plays out. Rendering needs OpenGL
-(MUJOCO_GL=glfw by default; egl on a headless machine).
+The numbers on the GIF come from results/ (tools/make_figures.py), not from arguments. The camera follows the robot through
+the command plan of the rollout. The published GIF shows seed 0 after 14 minutes of training (checkpoint 0012), robot 8 of the
+rollout above, which walks over a field of pits and rough ground. Rendering needs OpenGL (MUJOCO_GL=glfw by default; egl on a
+headless machine).
 """
 
 from __future__ import annotations
@@ -44,28 +45,28 @@ def font(size, bold=False):
         return ImageFont.truetype(os.path.join(matplotlib.get_data_path(), "fonts", "ttf", name), size)
 
 
-def model(rec):
+def model(rec, width=2 * PANEL, height=2 * H):
     """The training scene (the rollout's terrain, the G1 with its visual meshes) restyled: a white sky the terrain fades into,
-    light gray ground whose relief shows in a key light's shading, and soft shadows."""
+    light gray ground whose relief shows in a key light's shading, and soft shadows. width and height bound the image size."""
     tr = terrain.generate(terrain.TerrainCfg.scaled(float(rec["scale"]), int(rec["seed"]) if "seed" in rec.files else 42))
     if not os.path.isdir(os.path.join(ROOT, "assets", "meshes")) and not os.environ.get("XSOMA_G1_XML"):
         sys.exit("the G1 meshes are missing: run bash tools/download_meshes.sh")
     spec = scene.spec(terrain=tr, visual=True)
     v = spec.visual
-    v.global_.offwidth, v.global_.offheight = 2 * PANEL, 2 * H
+    v.global_.offwidth, v.global_.offheight = width, height
     v.quality.shadowsize, v.quality.offsamples = 8192, 8
-    v.headlight.ambient, v.headlight.diffuse, v.headlight.specular = [0.36] * 3, [0.10] * 3, [0.02] * 3
+    v.headlight.ambient, v.headlight.diffuse, v.headlight.specular = [0.22] * 3, [0.10] * 3, [0.02] * 3
     v.map.fogstart, v.map.fogend, v.map.shadowclip, v.map.shadowscale = 4.0, 12.0, 3.0, 0.8
     v.rgba.fog = [1.0, 1.0, 1.0, 1.0]
     spec.stat.extent = 2.0  # MuJoCo scales the clipping planes with the scene's extent, which the terrain makes 100+ m
     spec.add_texture(name="sky", type=mujoco.mjtTexture.mjTEXTURE_SKYBOX, builtin=mujoco.mjtBuiltin.mjBUILTIN_FLAT, rgb1=[1, 1, 1],
                      rgb2=[1, 1, 1], width=64, height=64)  # fmt: skip
-    for name, d, diffuse, shadow in (("key", [-0.45, 0.6, -0.9], 0.62, True), ("fill", [0.5, -0.4, -1.0], 0.20, False)):
+    for name, d, diffuse, shadow in (("key", [-0.45, 0.6, -0.9], 0.80, True), ("fill", [0.5, -0.4, -1.0], 0.20, False)):
         light = spec.worldbody.add_light(name=name, pos=[0, 0, 6], dir=d, castshadow=shadow, diffuse=[diffuse] * 3, specular=[0.08 if shadow else 0.0] * 3)
         light.type = mujoco.mjtLightType.mjLIGHT_DIRECTIONAL
     for g in spec.geoms:
         if g.name.startswith("floor"):
-            g.rgba = [0.80, 0.80, 0.79, 1.0]
+            g.rgba = [0.78, 0.79, 0.80, 1.0]
     return spec.compile()
 
 

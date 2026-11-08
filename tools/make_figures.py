@@ -3,7 +3,8 @@
     python tools/make_figures.py [--results results] [--figures figures]   # figures (light and dark), the table on stdout
 
 results/<method>/<run>/eval.jsonl holds one record per checkpoint: Holosoma's tracking metrics, falls and tracking errors of 2048
-deterministic 20-s episodes, and the checkpoint's wall-clock time since the run's launch (start-up and compilation included).
+deterministic 20-s episodes. Time is training time, as in XMimic: start-up and one-time compilation are excluded for every
+method (see training_seconds).
 
 The target is Holosoma's own bar for its FastSAC preset (its nightly test: Episode/rew_tracking_lin_vel >= 0.95 and
 Episode/rew_tracking_ang_vel >= 0.8), here on deterministic evaluations, held for three consecutive checkpoints. Colors follow
@@ -32,7 +33,7 @@ LABEL = {"xsoma": "XSoma", "fast_sac": "Holosoma FastSAC", "ppo": "Holosoma PPO"
 TARGET = {"rew_tracking_lin_vel": 0.95, "rew_tracking_ang_vel": 0.8}
 STEPS_PER = {"xsoma": 1, "fast_sac": 4096, "ppo": 24 * 4096}  # env steps per unit of a record's "steps" (Holosoma: iterations)
 HELD = 3
-BUDGET = 60.0  # minutes shown
+BUDGET = 15.0  # minutes shown: every method's comparison is decided within them
 METRICS = (("rew_tracking_lin_vel", "Velocity tracking", "Holosoma's Episode/rew_tracking_lin_vel (max 2.0); dashed: the target", 0.95),
            ("err_v", "Velocity error", "m/s, mean |command - velocity| while upright", None),
            ("success", "Episodes without a fall", "share of 2048 episodes of 20 s", None))  # fmt: skip
@@ -46,15 +47,33 @@ FONT = ["Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"]
 
 
 # ---------------------------------------------------------------- data
+def training_seconds(run, rows):
+    """Each checkpoint's training time (s), start-up and one-time compilation excluded.
+
+    XSoma compiles before its training clock starts: its log.jsonl records both clocks, so the training time is the
+    checkpoint's time since launch minus the start-up. Holosoma compiles (torch.compile, CUDA graphs) inside its training
+    loop: train_log.csv holds the time it logs since its loop started ("Total time") per logged iteration, and the first
+    logged interval's excess over the steady pace, its one-time compilation, is removed."""
+    if os.path.exists(os.path.join(run, "log.jsonl")):
+        startup = float(np.median([r["wall_s"] - r["train_s"] for r in map(json.loads, open(os.path.join(run, "log.jsonl")))]))
+        return [r["wall_s"] - startup for r in rows]
+    if os.path.exists(os.path.join(run, "train_log.csv")):
+        it, total = np.loadtxt(os.path.join(run, "train_log.csv"), delimiter=",", skiprows=1, unpack=True)
+        pace = float(np.median(np.diff(total[:21]) / np.diff(it[:21])))  # seconds per iteration, steady
+        excess = total[0] - pace * (it[0] + 1)  # the first logged interval covers iterations 0 to it[0]
+        return [float(np.interp(r["steps"], it, total)) - excess for r in rows]  # Holosoma's steps are iterations
+    return [r["wall_s"] for r in rows]  # no log: time since launch
+
+
 def load_results(root=os.path.join(ROOT, "results")):
-    """{method: [rows of each run, sorted by minutes since launch]}."""
+    """{method: [rows of each run, sorted by training time]}."""
     out = {}
     for m in METHODS:
         runs = []
         for path in sorted(glob.glob(os.path.join(root, m, "*", "eval.jsonl"))):
             rows = [json.loads(line) for line in open(path)]
-            for r in rows:
-                r["min"] = r["wall_s"] / 60
+            for r, t in zip(rows, training_seconds(os.path.dirname(path), rows)):
+                r["train_s"], r["min"] = t, t / 60
             runs.append(sorted(rows, key=lambda r: r["min"]))
         if runs:
             out[m] = runs
@@ -72,13 +91,13 @@ def target_row(rows, held=HELD):
 
 
 def time_to_target(rows, held=HELD):
-    """Minutes since launch of the first checkpoint from which `held` consecutive checkpoints meet the target."""
+    """Training minutes of the first checkpoint from which `held` consecutive checkpoints meet the target."""
     r = target_row(rows, held)
     return None if r is None else r["min"]
 
 
 def value_at(rows, key, minute):
-    """A run's metric at a time since launch: its last checkpoint at or before it."""
+    """A run's metric after some minutes of training: its last checkpoint at or before then."""
     before = [r for r in rows if r["min"] <= minute]
     return before[-1][key] if before else None
 
@@ -93,7 +112,7 @@ def summarize(results):
                   "steps": steps, "end": float(np.mean([rows[-1]["min"] for rows in runs])),
                   **{f"{k}@end": float(np.mean([rows[-1][k] for rows in runs])) for k in ("err_v", "err_w", "success", "rew_tracking_lin_vel")},
                   **{f"{k}@{t}": float(np.mean([value_at(rows, k, t) for rows in runs])) for k in ("err_v", "err_w", "success", "rew_tracking_lin_vel")
-                     for t in (10, 20, 60) if all(value_at(rows, k, t) is not None for rows in runs)}}  # fmt: skip
+                     for t in (10, BUDGET, 20, 60) if all(value_at(rows, k, t) is not None for rows in runs)}}  # fmt: skip
     return out
 
 
@@ -155,10 +174,10 @@ def learning_curves(results, theme, out):
         if line is not None:
             ax.axhline(line, color=t["muted"], lw=1.0, ls=(0, (4, 3)), zorder=1)
         ax.set_xlim(0, BUDGET)
-        ax.set_xticks(np.arange(0, BUDGET + 1, 10))
+        ax.set_xticks(np.arange(0, BUDGET + 1, 5))
         ax.set_title(title, loc="left", color=t["ink"], fontsize=11.5, pad=18)
         ax.text(0, 1.03, sub, transform=ax.transAxes, color=t["muted"], fontsize=9, va="bottom")
-        ax.set_xlabel("minutes since launch", color=t["ink2"], fontsize=10)
+        ax.set_xlabel("minutes of training", color=t["ink2"], fontsize=10)
         if key == "success":
             ax.set_ylim(0, 1.0)
             ax.yaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1.0, decimals=0))
@@ -179,7 +198,7 @@ def time_to_target_figure(summary, theme, out):
     keys = [m for m in METHODS if m in summary]
     n = len(keys)
     times = [x for m in keys for x in summary[m]["held"]]
-    top = max(20.0, 5 * np.ceil(1.3 * max(times, default=10.0) / 5))
+    top = max(BUDGET, 5 * np.ceil((max(times, default=10.0) + 3) / 5))  # room for the label right of the last run
     fig_h = 1.3 + 0.62 * n
     fig = plt.figure(figsize=(9.0, fig_h), facecolor=t["surface"])
     ax = fig.add_axes((0.22, 0.45 / fig_h, 0.62, (fig_h - 1.2) / fig_h))
@@ -200,7 +219,7 @@ def time_to_target_figure(summary, theme, out):
             ax.text(top * 0.01, i, f"not reached in {5 * round(s['end'] / 5):.0f} min ({runs})", va="center", ha="left", color=t["ink2"], fontsize=10.5)
     ax.set_yticks(range(n), [LABEL[m] for m in keys], color=t["ink"], fontsize=11)
     ax.set_xticks(np.arange(0, top + 1, 5))
-    ax.set_xlabel("minutes from launch (start-up and compilation included)", color=t["ink2"], fontsize=10)
+    ax.set_xlabel("minutes of training (start-up and compilation excluded)", color=t["ink2"], fontsize=10)
     fig.text(0.012, 1 - 0.30 / fig_h, "Time to Holosoma's FastSAC bar on one H100", ha="left", va="center", color=t["ink"], fontsize=13.5,
              fontweight="bold")  # fmt: skip
     fig.text(0.012, 1 - 0.60 / fig_h, "velocity tracking ≥ 0.95 and yaw-rate tracking ≥ 0.8 (Holosoma's nightly test), held for 3 checkpoints; dots: runs",
@@ -211,8 +230,8 @@ def time_to_target_figure(summary, theme, out):
 
 def table(summary):
     ref = float(np.mean(summary["fast_sac"]["held"])) if summary.get("fast_sac", {}).get("held") else None
-    lines = ["| method | runs | time to target (min) | speedup | env steps to target | after 20 min: velocity error, falls | at the end: velocity error, falls |",
-             "|---|---|---|---|---|---|---|"]  # fmt: skip
+    lines = [f"| method | runs | time to target (min) | speedup | env steps to target | after {BUDGET:.0f} min: velocity error, falls |",
+             "|---|---|---|---|---|---|"]  # fmt: skip
     for m in METHODS:
         if m not in summary:
             continue
@@ -224,9 +243,8 @@ def table(summary):
             tt = f"not within {5 * round(s['end'] / 5):.0f}"  # the run length
         sp = f"{ref / np.mean(s['held']):.1f}×" if ref and s["held"] and len(s["held"]) == s["runs"] else "–"
         st = f"{np.mean(s['steps']) / 1e6:.0f} M" if s["steps"] else "–"
-        at = f"{s['err_v@20']:.2f} m/s, {100 * (1 - s['success@20']):.1f} %" if "err_v@20" in s else "–"
-        end = f"{s['err_v@end']:.2f} m/s, {100 * (1 - s['success@end']):.1f} % ({s['end']:.0f} min)"
-        lines.append(f"| {LABEL[m]} | {s['runs']} | {tt} | {sp} | {st} | {at} | {end} |")
+        at = f"{s[f'err_v@{BUDGET}']:.2f} m/s, {100 * (1 - s[f'success@{BUDGET}']):.1f} %" if f"err_v@{BUDGET}" in s else "–"
+        lines.append(f"| {LABEL[m]} | {s['runs']} | {tt} | {sp} | {st} | {at} |")
     return "\n".join(lines)
 
 

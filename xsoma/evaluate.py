@@ -1,16 +1,17 @@
-"""Deterministic evaluation of policies in the simulator: every env runs one full episode (up to 1001 steps, 20 s) with the
-policy's mean action, training's randomization (masses, friction, PD gains, delay, pushes) and terrain, all envs starting at step 0.
+"""Deterministic evaluation of policies in the simulator. Every env runs one full episode (up to 1001 steps, 20 s) with the
+policy's mean action, on training's terrain and with training's randomization (masses, friction, PD gains, delay, pushes). All
+envs start at step 0.
 
-Per policy: Holosoma's logged metrics (Episode/rew_<term> = the episode's sum of w dt r / 20 s, averaged over episodes; penalties
-at full weight, penalty scale 1), the mean episode length, the share of episodes that reach the time-out without a fall, and the
-mean velocity-tracking errors while alive. Policies: XSoma checkpoints (train.save_ckpt) and Holosoma's PPO / FastSAC actors
-(converted by tools/holosoma_ckpt.py), evaluated alike.
+Per policy it reports Holosoma's logged metrics (Episode/rew_<term> = the episode's sum of w dt r / 20 s, averaged over episodes;
+penalties at full weight, penalty scale 1), the mean episode length, the share of episodes that reach the time-out without a
+fall (`success`), and the mean velocity-tracking errors while the robot is alive. The policies are XSoma checkpoints
+(train.save_ckpt) and Holosoma's PPO and FastSAC actors (converted by tools/holosoma_ckpt.py), all evaluated alike.
 
     python -m xsoma.evaluate <run dir or checkpoint> [...] [--n 2048] [--scale 0.5] [--sole_friction 0] [--preset fast_sac]
 
 A run directory is evaluated checkpoint by checkpoint (XSoma: ckpt/*.npz; Holosoma: hs/**/model_*.npz), each with its wall-clock
-time since the run's launch, and the records are appended to <run>/eval.jsonl. The defaults are the setting Holosoma's MJWarp
-baselines train in: terrain scale 0.5, sole friction fixed at 0.8.
+time since the run's launch, and the records are appended to <run>/eval.jsonl. The defaults are the setting that Holosoma's
+MuJoCo Warp baselines train in: terrain scale 0.5, sole friction fixed at 0.8. train.py calls this module after training.
 """
 
 import argparse
@@ -30,7 +31,9 @@ from .sim import Sim, SimCfg  # noqa: E402
 
 
 def evaluate(sim: Sim, act, key, steps: int = task.MAX_EPISODE + 2):
-    """act(obs) -> actions; per-env first-episode term sums, lengths, falls, ended flags and mean tracking errors."""
+    """Run every env for one episode with the deterministic policy `act(obs) -> action`. The default number of steps lets every
+    env reach the time-out. Returns, per env, for its first episode only: the sums of the weighted reward terms, the length,
+    whether it ended in a fall, whether it ended at all, and the mean velocity and yaw-rate tracking errors while alive."""
     N = sim.N
     s = sim.init(key)
     s = s._replace(scale=jnp.ones_like(s.scale))  # penalties at full weight
@@ -38,9 +41,9 @@ def evaluate(sim: Sim, act, key, steps: int = task.MAX_EPISODE + 2):
     def body(carry, _):
         s, sums, ended, length, fell, err_v, err_w, alive_steps = carry
         s1, tr = sim.step(s, act(s.obs))
-        live = ~ended
+        live = ~ended  # the env's first episode is still running; what happens after its reset does not count
         sums = sums + jnp.where(live[:, None], tr.parts, 0.0)
-        R = sim.view(tr.qpos1, tr.qvel1, s.world.heights).robot
+        R = sim.view(tr.qpos1, tr.qvel1, s.world.heights).robot  # the robot after the physics, before any reset
         v_b = jnp.einsum("nji,nj->ni", R.R, R.v)
         err_v = err_v + jnp.where(live, jnp.linalg.norm(s.cmd[:, :2] - v_b[:, :2], axis=-1), 0.0)
         err_w = err_w + jnp.where(live, jnp.abs(s.cmd[:, 2] - R.w[:, 2]), 0.0)
@@ -48,6 +51,7 @@ def evaluate(sim: Sim, act, key, steps: int = task.MAX_EPISODE + 2):
         end = (tr.terminated | tr.truncated) & live
         length = jnp.where(end, s.t + 1, length)
         fell = fell | (tr.terminated & live)
+        # a step updates the penalty curriculum, so the scale is set back to 1
         return (s1._replace(scale=jnp.ones_like(s1.scale)), sums, ended | end, length, fell, err_v, err_w, alive_steps), None
 
     z = jnp.zeros((N,))
@@ -67,7 +71,8 @@ def load(path, which="avg"):
 
 
 def act_fn(kind, normalize=False):
-    """(parameters, obs) -> deterministic action; the parameters are an argument, so one compilation serves a policy type."""
+    """(parameters, obs) -> deterministic action of a policy type (`kind` is "xsoma", "ppo" or "fast_sac"). The parameters are an
+    argument, so one compilation serves a policy type."""
     if kind == "xsoma":
         return nets.pi_apply
 
@@ -106,21 +111,22 @@ def checkpoints(run):
             z = np.load(p)
             if "wall_s" in z.files:
                 wall = float(z["wall_s"])
-            else:
+            else:  # no stored time: the .pt file's modification time minus the launch time that <run>/t_start holds
                 wall = os.path.getmtime(p[: -len(".npz")] + ".pt") - float(open(os.path.join(run, "t_start")).read().split()[0])
             out.append((p, wall, int(z["iteration"])))
     return out
 
 
 def load_policy(path, which="avg"):
+    """The layers (a list of parameter dicts) of the `avg` (averaged) or the `live` policy in an XSoma checkpoint."""
     z = np.load(path)
     n = 1 + max(int(k.split("/")[1]) for k in z.files if k.startswith(which + "/"))
     return [{k.split("/")[2]: jnp.asarray(z[k]) for k in z.files if k.startswith(f"{which}/{i}/")} for i in range(n)]
 
 
 def make_sim(n=2048, scale=0.5, sole_friction=False, preset="fast_sac", terrain="mix"):
-    """The evaluation simulator; the defaults are the setting Holosoma's MJWarp baselines train in (terrain scale 0.5, sole
-    friction fixed at 0.8)."""
+    """The evaluation simulator; the defaults are the setting that Holosoma's MuJoCo Warp baselines train in (terrain scale 0.5,
+    sole friction fixed at 0.8)."""
     return Sim(SimCfg(num_envs=n, terrain=terrain, terrain_scale=scale, preset=preset, sole_friction=sole_friction, random_start=False))
 
 
@@ -132,9 +138,10 @@ def run_all(sim: Sim, jobs, seed=1, which="avg", out=None):
         kind, normalize, params = load(path, which)
         if (kind, normalize) not in progs:
             act = act_fn(kind, normalize)
+            # the parameters enter as arguments, so every checkpoint of a policy type reuses one compilation
             progs[(kind, normalize)] = jax.jit(lambda p, k, act=act: evaluate(sim, jax.tree_util.Partial(act, p), k))
         sums, length, fell, ended, ev, ew = jax.device_get(progs[(kind, normalize)](params, key))
-        rew = sums.mean(0) / (task.MAX_EPISODE * task.DT)
+        rew = sums.mean(0) / (task.MAX_EPISODE * task.DT)  # the episode sums per second, as Holosoma logs them
         rec = {"ckpt": path, "kind": kind, "wall_s": wall, "steps": steps, "n": sim.N, "scale": sim.cfg.terrain_scale, "sole_friction": sim.cfg.sole_friction,
                "len": float(length.mean()), "success": float(1 - fell.mean()), "ended": float(ended.mean()), "err_v": float(ev.mean()),
                "err_w": float(ew.mean()), **{f"rew_{k}": float(v) for k, v in zip(task.TERMS, rew)}}  # fmt: skip

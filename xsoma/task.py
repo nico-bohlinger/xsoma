@@ -2,7 +2,9 @@
 as pure JAX functions of the robot's state, shared by the simulator (`sim.py`) and by imagination in the world model.
 
 Every number below is Holosoma's; "spec N" cites section N of docs/holosoma_task.md, which cites Holosoma's source line by
-line. Joint order is Holosoma's config order, which is also the MJCF's joint order, so `q = qpos[7:]`.
+line. Joint order is Holosoma's config order, which is also the MJCF's joint order, so `q = qpos[7:]`. The constants of the
+task (PD gains, commands, rewards, penalty curriculum, randomization ranges, reset values) sit next to the functions that
+use them.
 
 A robot state is a `Robot`: pelvis position and rotation, the pelvis frame's world linear velocity (MuJoCo's free-joint
 convention, spec 2.3), the body-frame angular velocity, joint positions and velocities, and the frames the task reads (foot
@@ -30,19 +32,22 @@ J = len(DOF)
 LEG = np.asarray([-0.312, 0.0, 0.0, 0.669, -0.363, 0.0])
 DEFAULT_Q = np.concatenate([LEG, LEG, np.zeros(3), [0.2, 0.2, 0.0, 0.6, 0.0, 0.0, 0.0], [0.2, -0.2, 0.0, 0.6, 0.0, 0.0, 0.0]]).astype(np.float32)
 
-_HIP_P = (40.179238471, 2.557889765)  # kp = I w^2, kd = 2 zeta I w, w = 2 pi 10 rad/s, zeta = 2 (spec 1.5)
+# (kp, kd) of each motor type, from its armature I: kp = I w^2, kd = 2 zeta I w, with w = 2 pi 10 rad/s and zeta = 2 (spec 1.5)
+_HIP_P = (40.179238471, 2.557889765)
 _HIP_R = (99.098427777, 6.308801854)
 _ANKLE = (28.501246196, 1.814445687)
 _ARM = (14.250623098, 0.907222843)
 _WRIST = (16.778327481, 1.068141502)
-_LEG_GAINS = [_HIP_P, _HIP_R, _HIP_P, _HIP_R, _ANKLE, _ANKLE]  # hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll
+# per leg joint: hip_pitch, hip_roll, hip_yaw, knee, ankle_pitch, ankle_roll (the knee has the same gains as the hip roll)
+_LEG_GAINS = [_HIP_P, _HIP_R, _HIP_P, _HIP_R, _ANKLE, _ANKLE]
 _ARM_GAINS = [_ARM, _ARM, _ARM, _ARM, _ARM, _WRIST, _WRIST]
 _GAINS = _LEG_GAINS * 2 + [_HIP_P, _ANKLE, _ANKLE] + _ARM_GAINS * 2  # waist yaw like hip_pitch, roll / pitch like ankles
 KP = np.asarray([g[0] for g in _GAINS], np.float32)
 KD = np.asarray([g[1] for g in _GAINS], np.float32)
-EFFORT = np.asarray([88, 139, 88, 139, 50, 50] * 2 + [88, 50, 50] + [25, 25, 25, 25, 25, 5, 5] * 2, np.float32)  # config limits
-ACTION_SCALE, ACTION_CLIP = 0.25, 100.0
-SIM_DT, DECIMATION = 0.005, 4
+# torque limits (N m) in Holosoma's config; the MJCF's motors clamp the hip roll to 88 on top of this (see sim.py)
+EFFORT = np.asarray([88, 139, 88, 139, 50, 50] * 2 + [88, 50, 50] + [25, 25, 25, 25, 25, 5, 5] * 2, np.float32)
+ACTION_SCALE, ACTION_CLIP = 0.25, 100.0  # joint target = DEFAULT_Q + ACTION_SCALE * action; the action is clipped first
+SIM_DT, DECIMATION = 0.005, 4  # physics step, and physics steps per policy step
 DT = SIM_DT * DECIMATION  # 50 Hz policy
 MAX_EPISODE = 1000  # time-out once the step counter exceeds it: an un-terminated episode has 1001 policy steps (spec 1.6)
 
@@ -52,7 +57,7 @@ FEET = ("left_ankle_roll_link", "right_ankle_roll_link")
 TERMINATION_BODIES = ("pelvis", "left_hip_pitch_link", "left_hip_roll_link", "left_hip_yaw_link", "right_hip_pitch_link",
                       "right_hip_roll_link", "right_hip_yaw_link", "left_shoulder_pitch_link", "left_shoulder_roll_link",
                       "left_shoulder_yaw_link", "right_shoulder_pitch_link", "right_shoulder_roll_link", "right_shoulder_yaw_link")  # fmt: skip
-CONTACT_FORCE = 1.0  # N (spec 7)
+CONTACT_FORCE = 1.0  # N: a net contact force above this on a termination body ends the episode (spec 7)
 
 
 class Robot(NamedTuple):
@@ -68,21 +73,22 @@ class Robot(NamedTuple):
 
 
 def torques(q, qd, a_applied, kp_scale, kd_scale):
-    """PD law of one 5 ms substep (spec 1.5): clip(kp' (0.25 a + q0 - q) - kd' qd, +-config effort limit)."""
+    """PD torques of one 5 ms physics substep (spec 1.5): kp_scale * KP * (target - q) - kd_scale * KD * qd, clipped to the
+    effort limits. The joint target is q0 + 0.25 a, with q0 the default pose."""
     tau = kp_scale * KP * (ACTION_SCALE * a_applied + DEFAULT_Q - q) - kd_scale * KD * qd
     return jnp.clip(tau, -EFFORT, EFFORT)
 
 
 # ------------------------------------------------------------------ commands and gait (spec 5)
 CMD_RANGE = 1.0  # vx, vy, wz ~ U[-1, 1] (body frame)
-STAND_PROB = 0.2
-RESAMPLE = int(10.0 / DT)  # 500 steps
-GAIT_FREQ = (0.8, 1.2)  # Hz, 1 / gait_period +- width
-STAND_PHASE = math.pi
+STAND_PROB = 0.2  # probability that a drawn command is zero in all three components (the robot should stand)
+RESAMPLE = int(10.0 / DT)  # commands change every 10 s = 500 steps
+GAIT_FREQ = (0.8, 1.2)  # Hz: 1 / gait_period (a period of 1 s), plus or minus a width of 0.2
+STAND_PHASE = math.pi  # the gait phase of both feet while standing
 
 
 def sample_commands(key, n):
-    """Resampled command [vx, vy, wz] and gait frequency (every resample redraws both, spec 5)."""
+    """Draw n commands [vx, vy, wz] and gait frequencies; every resample redraws both (spec 5)."""
     kc, ks, kf = jax.random.split(key, 3)
     cmd = jax.random.uniform(kc, (n, 3), minval=-CMD_RANGE, maxval=CMD_RANGE)
     cmd = jnp.where(jax.random.uniform(ks, (n, 1)) <= STAND_PROB, 0.0, cmd)
@@ -96,7 +102,8 @@ def sample_phase_offsets(key, n):
 
 
 def gait_phase(episode_step, freq, offsets, cmd):
-    """phi = fmod(t * 2 pi dt f + offset + pi, 2 pi) - pi from the episode counter; both feet at pi when the command is zero."""
+    """Gait phase phi of each foot from the episode counter t: fmod(t * 2 pi dt f + offset + pi, 2 pi) - pi. Both feet are held
+    at pi (standing) when the command is zero."""
     phase_dt = 2 * math.pi * DT * freq
     phi = jnp.fmod(episode_step[:, None] * phase_dt[:, None] + offsets + math.pi, 2 * math.pi) - math.pi
     stand = (jnp.linalg.norm(cmd[:, :2], axis=-1) < 0.01) & (jnp.abs(cmd[:, 2]) < 0.01)
@@ -116,13 +123,15 @@ def swing_height(phi, height: float = 0.09):
 # ------------------------------------------------------------------ observations (spec 3)
 GRAVITY = np.asarray([0.0, 0.0, -1.0], np.float32)
 ACTOR_DIM, CRITIC_DIM = 100, 103
+# the terms of the actor observation in order, with their sizes (Holosoma sorts its observation terms alphabetically)
 ACTOR_LAYOUT = (("actions", J), ("base_ang_vel", 3), ("command_ang_vel", 1), ("command_lin_vel", 2), ("cos_phase", 2), ("dof_pos", J),
                 ("dof_vel", J), ("projected_gravity", 3), ("sin_phase", 2))  # fmt: skip
 OBS_CLIP = 100.0
 
 
 def projected_gravity(R):
-    return jnp.einsum("...ji,j->...i", R, GRAVITY)  # R^T (0, 0, -1)
+    """The direction of gravity in the pelvis frame: R^T (0, 0, -1)."""
+    return jnp.einsum("...ji,j->...i", R, GRAVITY)
 
 
 def observations(robot: Robot, a_last, cmd, phase, key=None):
@@ -150,7 +159,9 @@ def observations(robot: Robot, a_last, cmd, phase, key=None):
 
 
 # ------------------------------------------------------------------ rewards (spec 6)
+# weight of each joint's squared offset from the default pose, in DOF order: the six leg joints twice, then 3 waist, 14 arm joints
 POSE_W = np.asarray([0.01, 1.0, 5.0, 0.01, 5.0, 5.0] * 2 + [50.0] * 3 + [50.0] * 14, np.float32)
+# the terms whose weights the penalty curriculum scales
 PENALTIES = ("ang_vel_xy", "orientation", "action_rate", "pose", "close_feet_xy", "feet_ori")
 
 
@@ -177,14 +188,14 @@ FAST_SAC_REWARD = RewardCfg(alive=10.0)  # the presets differ only in the alive 
 def reward_terms(robot: Robot, foot_heights, a, a_prev, cmd, phase):
     """Unweighted terms of one step. foot_heights (N, 2): foot contact points over the terrain; phase / cmd: the ones the
     policy observed when it chose `a` (spec 6, timing)."""
-    v_b = jnp.einsum("nji,nj->ni", robot.R, robot.v)
+    v_b = jnp.einsum("nji,nj->ni", robot.R, robot.v)  # velocity in the pelvis frame
     g = projected_gravity(robot.R)
     yaw = jnp.arctan2(robot.R[:, 1, 0], robot.R[:, 0, 0])
     dx = robot.feet_p[:, 0, 0] - robot.feet_p[:, 1, 0]
     dy = robot.feet_p[:, 0, 1] - robot.feet_p[:, 1, 1]
-    lateral = jnp.abs(jnp.cos(yaw) * dy - jnp.sin(yaw) * dx)
-    g_feet = jnp.einsum("nfji,j->nfi", robot.feet_R, GRAVITY)
-    err_h = jnp.sum(jnp.square(foot_heights - swing_height(phase)), -1)
+    lateral = jnp.abs(jnp.cos(yaw) * dy - jnp.sin(yaw) * dx)  # the feet's sideways distance, in the pelvis heading's frame
+    g_feet = jnp.einsum("nfji,j->nfi", robot.feet_R, GRAVITY)  # gravity in each foot's frame (zero x and y when flat)
+    err_h = jnp.sum(jnp.square(foot_heights - swing_height(phase)), -1)  # squared foot height error against the gait reference
     return {
         "tracking_lin_vel": jnp.exp(-jnp.sum(jnp.square(cmd[:, :2] - v_b[:, :2]), -1) / 0.25),
         "tracking_ang_vel": jnp.exp(-jnp.square(cmd[:, 2] - robot.w[:, 2]) / 0.25),
@@ -199,7 +210,7 @@ def reward_terms(robot: Robot, foot_heights, a, a_prev, cmd, phase):
     }
 
 
-TERMS = tuple(f.name for f in dataclasses.fields(RewardCfg))
+TERMS = tuple(f.name for f in dataclasses.fields(RewardCfg))  # the reward terms, in the order of every per-term array
 
 
 def weighted(terms, cfg: RewardCfg, penalty_scale):
@@ -209,6 +220,7 @@ def weighted(terms, cfg: RewardCfg, penalty_scale):
 
 
 def reward(terms, cfg: RewardCfg, penalty_scale):
+    """The reward of one step: the sum of the weighted terms."""
     return sum(weighted(terms, cfg, penalty_scale).values())
 
 
@@ -243,20 +255,21 @@ def curriculum_step(cfg: CurriculumCfg, scale, avg_len, finished_lengths, finish
 
 
 # ------------------------------------------------------------------ domain randomization (spec 9)
+# "setup only": drawn once per env when the simulator is built; the others are redrawn at every reset or on a schedule
 MASS_BODIES = ("pelvis", "left_hip_yaw_link", "left_hip_roll_link", "left_hip_pitch_link", "left_knee_link",
                "right_hip_yaw_link", "right_hip_roll_link", "right_hip_pitch_link", "right_knee_link")  # fmt: skip
-MASS_SCALE = (0.9, 1.2)  # x U, inertia scaled by the same ratio (setup only)
+MASS_SCALE = (0.9, 1.2)  # the masses of MASS_BODIES times U, inertia scaled by the same ratio (setup only)
 TORSO_ADDED_MASS = (-1.0, 3.0)  # kg on torso_link (setup only)
 TORSO_COM = 0.05  # +-m per axis on torso_link (setup only)
-FRICTION = (0.5, 1.25)  # 64 quantile buckets, one per env (setup only)
+FRICTION = (0.5, 1.25)  # range of the friction coefficient; each env gets one of 64 equally spaced values (setup only)
 FRICTION_BUCKETS = 64
 GAIN_SCALE = (0.9, 1.1)  # kp and kd per (env, joint), every reset
 MAX_DELAY = 1  # action delay in policy steps, U{0, 1} per env at every reset
-PUSH_INTERVAL = (5.0, 10.0)  # s, per env; a push sets the root's world (vx, vy) to U[-1, 1] each (overwrite)
+PUSH_INTERVAL = (5.0, 10.0)  # s between pushes, per env; a push overwrites the root's world (vx, vy) with U[-1, 1] each
 PUSH_VEL = 1.0
 
 # ------------------------------------------------------------------ resets (spec 8)
-SPAWN_HEIGHT = 0.8  # pelvis z above the tile origin (terrain not re-queried)
+SPAWN_HEIGHT = 0.8  # pelvis height above the tile origin (the terrain at the spawn point is not looked up)
 SPAWN_XY = 1.0  # U[-1, 1] m offset from the tile origin
 SPAWN_VEL = 0.5  # all six root velocities U[-0.5, 0.5] (world frame)
 SPAWN_Q = (0.5, 1.5)  # q = q0 * U, joints with q0 = 0 start at 0; qd = 0

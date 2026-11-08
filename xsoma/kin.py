@@ -18,6 +18,9 @@ from .rot import axis_angle_to_mat, mm3, mv3, quat_to_mat
 
 
 class Kinematics:
+    """Forward kinematics for a fixed list of bodies: `forward` takes the root pose and the joint angles and returns the world
+    poses of exactly those bodies."""
+
     def __init__(self, m: mujoco.MjModel, bodies: Sequence[str]):
         assert m.jnt_type[0] == mujoco.mjtJoint.mjJNT_FREE and m.jnt_bodyid[0] == 1, "joint 0 must be the root's free joint"
         self.parent = [int(b) for b in m.body_parentid]
@@ -40,7 +43,7 @@ class Kinematics:
 
     def forward(self, p, R, q):
         """World positions (..., n, 3) and rotations (..., n, 3, 3) of the requested bodies, given the root pose (p, R)."""
-        P, Rs = {1: p}, {1: R}
+        P, Rs = {1: p}, {1: R}  # by body id: body 1 is the pelvis (the free root), body 0 the world
         for b in self.order:
             par = self.parent[b]
             P[b] = P[par] + mv3(Rs[par], self.pos[b])

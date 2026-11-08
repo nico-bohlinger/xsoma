@@ -2,14 +2,20 @@
 Holosoma's G1 velocity-tracking task.
 
 One iteration:
-  1. collect `env_steps` steps of all envs with the policy plus Gaussian action noise (sim.Sim) into a replay buffer;
-  2. fit the world model `wm_batches` times on 8-step windows of real transitions (open loop, the recorded PD targets);
+  1. collect `env_steps` steps of all envs into a replay buffer (sim.Sim). The policy acts with Gaussian noise added, except in
+     a share `det_share` of the envs, which act without noise;
+  2. fit the world model `wm_batches` times on `wm_window`-step windows of real transitions. It predicts a window open loop:
+     from the window's first state only, fed with the PD targets that were applied;
   3. update the policy `pi_updates` times: from replayed states, roll the policy out `horizon` steps in the world model and
      ascend the discounted sum of Holosoma's rewards along it. Observations, rewards and terminations of the imagined states
      are the task's own functions (task.py) on forward kinematics and the exact terrain surface (sim.Sim.view_state), so the
      gradient flows through the world model, the policy and the reward alike. There is no critic.
-The three parts run as donated, ahead-of-time compiled programs, compiled in parallel; the host only dispatches them and fetches
-statistics every `log_every` iterations. Checkpoints record the wall-clock time since launch, start-up and compilation included.
+The three parts are separate programs, compiled ahead of time and in parallel. Each takes the whole training state and updates it
+in place (donated buffers). The host only starts them and fetches statistics every `log_every` iterations. Checkpoints record
+the training time and the wall-clock time since launch.
+
+The file holds `Config` (every option, also the command-line flags), `XSoma` (the simulator, the networks and the programs of
+one iteration) and `main` (the loop with logging, checkpoints and the final evaluation).
 """
 
 from __future__ import annotations
@@ -33,26 +39,29 @@ from .sim import Sim, SimCfg, unflatten
 
 @dataclasses.dataclass
 class Config:
+    """Every training option; each field is also a command-line flag of the same name. The defaults are the published ones."""
+
     # task and simulator (sim.SimCfg)
     num_envs: int = 4096
     terrain: str = "mix"  # mix: Holosoma's terrain_locomotion_mix | plane
-    terrain_scale: float = 0.5  # Holosoma's terrain scale factor; 0.5 as its MJWarp runs (1.0 trains too, see scene.py)
+    terrain_scale: float = 0.5  # Holosoma's terrain scale factor; 0.5 as in its MuJoCo Warp runs (1.0 trains too, see scene.py)
     foot: str = "capsules"  # capsules: Holosoma's MJCF soles | box: one box per sole
     preset: str = "fast_sac"  # Holosoma's reward and penalty-curriculum preset: fast_sac (g1_29dof_fast_sac) | ppo (g1_29dof);
-    #                           they differ in the alive weight (10 vs 1), which a 1-s horizon needs to value not falling
+    #                           they differ in the penalty curriculum and in the alive weight; the larger one (10, against 1)
+    #                           makes a policy that looks 1 s ahead value not falling
     sole_friction: int = 1  # friction randomization reaches the soles (Holosoma's MuJoCo backends keep them at 0.8)
-    random_start: int = 1  # episode counters start uniform in [0, 1000), as Holosoma's PPO
+    random_start: int = 1  # episode counters start uniform in [0, 1000), so episodes end at different times (as Holosoma's PPO)
     # schedule
-    minutes: float = 20.0  # training time, start-up excluded
+    minutes: float = 15.0  # training time, start-up excluded
     env_steps: int = 1  # env steps of all envs per iteration
     buffer_steps: int = 200  # replay buffer length in env steps (x num_envs transitions)
     warmup_steps: int = 32  # env steps collected before the first iteration
-    wm_only_iters: int = 200  # iterations that fit only the world model
+    wm_only_iters: int = 200  # first iterations, which fit only the world model (no policy updates)
     # world model
-    wm_hidden: str = "512,512,512"
-    wm_window: int = 8
-    wm_batches: int = 3
-    wm_batch: int = 2048
+    wm_hidden: str = "512,512,512"  # hidden layer widths
+    wm_window: int = 8  # steps per training window; the model predicts them open loop
+    wm_batches: int = 3  # gradient steps per iteration
+    wm_batch: int = 2048  # windows per gradient step
     wm_lr: float = 4e-4
     wm_muon: int = 1  # Muon on the hidden weight matrices, Adam elsewhere (BlinkMimic's MuonAdam)
     wm_gate: float = 2.0  # skip an iteration's policy updates while the world-model loss exceeds wm_gate x its running average
@@ -65,38 +74,42 @@ class Config:
     pi_clip: float = 1.0  # gradient-norm clip
     pi_gn_gate: float = 10.0  # skip an update whose gradient norm exceeds pi_gn_gate x the running average
     pi_ema: float = 0.995  # the evaluated policy is an exponential moving average of the trained one
-    gamma: float = 0.99
+    gamma: float = 0.99  # discount of the imagined return
     action_noise: float = 0.3  # std of the collected actions' Gaussian exploration noise
-    det_share: float = 0.5  # share of envs (spread over the terrain) that collect with the policy's action, without noise: with
-    #                        noisy collection only, policies trained past ~45 min come to rely on the noise and fall without it
+    det_share: float = 0.5  # share of envs that collect without noise, spread over the terrain; when every collected action is
+    #                         noisy, policies trained for about 45 minutes or more come to rely on the noise and fall without it
     cmd_fresh: float = 0.5  # share of imagined rollouts that start with a freshly drawn command
-    term_tau: float = 0.02  # imagined termination: exact forward, gradient of sigmoid(-clearance / term_tau)
+    term_tau: float = 0.02  # width (m) of the sigmoid that gives imagined terminations their gradient; their value stays exact
     # runtime
     imag_unroll: int = 4  # unrolling of the imagination loop (speed saturates at 4; compile time grows with it)
     imag_remat: str = "none"  # rematerialization of the imagination steps: none | dots | full (less memory, slower)
     mm_bf16: str = "imag"  # where matmuls output bf16, so their backward passes run on bf16 tensor cores: "" nowhere, "imag" in
     #                        imagination, "all" also in the world-model fits (collection and evaluation always output fp32)
-    log_every: int = 50
-    ckpt_minutes: float = 1.0
+    log_every: int = 50  # iterations per log line; the host waits for the GPU only here
+    ckpt_minutes: float = 1.0  # minutes of training between checkpoints
     eval_n: int = 2048  # > 0: after training, evaluate every checkpoint with this many envs (evaluate.py) into <log_dir>/eval.jsonl
     eval_scale: float = 0.5  # evaluation terrain scale
     eval_sole_friction: int = 0  # 0: soles at friction 0.8 in evaluation, as in Holosoma's MuJoCo training
-    seed: int = 0
+    seed: int = 0  # the terrain is drawn with seed 42 + seed, so seed 0 uses Holosoma's default terrain seed (42)
     log_dir: str = "runs/xsoma"
     jax_cache: str = "~/.cache/xsoma/jax"  # persistent compilation cache ("" for none): later runs load their programs
     xla_flags: str = "--xla_gpu_enable_triton_gemm=false"  # extra XLA flags, comma-separated, set before JAX's backend starts
     #                                                        (cuBLAS for every GEMM: faster on Hopper, neutral elsewhere)
 
 
-# floors of the world model's per-dimension error scale: position, rotation, linear and angular velocity (3 each), q, qd
+# The world-model loss measures each state dimension's error in units of its typical one-step change, but never below these
+# floors: position, rotation, linear and angular velocity (3 values each). The floors of q and qd are added in XSoma.__init__.
 ERR_FLOOR = ((3, 3e-3), (3, 5e-3), (3, 2e-2), (3, 5e-2))
 
 
 def widths(s: str):
+    """Layer widths from a comma-separated string: "512,512,512" gives (512, 512, 512)."""
     return tuple(int(x) for x in s.split(","))
 
 
 def set_jax(cache_dir: str = ""):
+    """Global JAX settings: bf16 matrix multiplications, and (if cache_dir is set) a compilation cache on disk that keeps every
+    program and XLA's autotuning results, so that later runs start faster."""
     jax.config.update("jax_default_matmul_precision", "bfloat16")
     if cache_dir:
         jax.config.update("jax_compilation_cache_dir", os.path.expanduser(cache_dir))
@@ -106,45 +119,58 @@ def set_jax(cache_dir: str = ""):
 
 
 def target_q(a):
+    """Joint position targets of the PD law for raw actions a (Holosoma: default pose + 0.25 a)."""
     return task.DEFAULT_Q + task.ACTION_SCALE * a
 
 
 class XSoma:
+    """The learner. All training state lives in one pytree, the `carry` (see `init`): the simulator state, the replay buffer,
+    the policy and the world model with their optimizer states, counters and running statistics. Every compiled program takes
+    the carry and returns the updated one."""
+
     def __init__(self, cfg: Config):
         self.cfg = c = cfg
         set_jax(c.jax_cache)
         self.sim = Sim(SimCfg(num_envs=c.num_envs, terrain=c.terrain, terrain_scale=c.terrain_scale, foot=c.foot, preset=c.preset,
                               sole_friction=bool(c.sole_friction), random_start=bool(c.random_start), seed=42 + c.seed))  # fmt: skip
         self.J = task.J
-        self.n_soles = len(self.sim.sole_radius)
+        self.n_soles = len(self.sim.sole_radius)  # the number of sole collider points
         J = self.J
+        # error floors of the world-model loss for every state dimension: ERR_FLOOR's four groups, then q and qd
         self.err_floor = np.concatenate([np.full((n,), v, np.float32) for n, v in ERR_FLOOR] + [np.full((J,), 3e-3, np.float32), np.full((J,), 5e-2, np.float32)])
 
     # ------------------------------------------------------------------ state
     def init(self, key):
         c, J = self.cfg, self.J
-        ks = jax.random.split(key, 4)
+        ks = jax.random.split(key, 4)  # keys for the env, the policy, the world model and the training loop
         env = self.sim.init(ks[0])
+        # the shapes of one step's record, found without running the step
         rec_t = jax.eval_shape(lambda s: self.record(s, *self.sim.step(s, jnp.zeros((c.num_envs, J))))[0], env)
         rec_t = rb.flatten({**rec_t, "ok": jax.ShapeDtypeStruct((c.num_envs,), jnp.float32)})
         self.xi_dim = rec_t["xi"].shape[-1]
         self.wm_in = (13 + 2 * J) + self.n_soles + J + self.xi_dim  # invariant state, sole clearances, PD error, dynamics context
         pi = nets.pi_init(ks[1], task.ACTOR_DIM, J)
+        # wm: network weights, wm_b: its normalizers; 12 + 2 J outputs: the changes of position, rotation, v, w (3 each), q, qd
         wm, wm_b = nets.wm_init(ks[2], self.wm_in, 12 + 2 * J, widths(c.wm_hidden))
+        # Muon masks (Muon where True, Adam elsewhere): none for the policy, the hidden weight matrices for the world model
         self.pi_mask = jax.tree.map(lambda _: False, pi)
         self.wm_mask = {"net": nets.muon_mask(wm["net"]) if c.wm_muon else jax.tree.map(lambda _: False, wm["net"])}
+        # avg: the averaged policy that gets evaluated; wm_ema, gn_ema: the running averages behind the two gates; wm_ok: the
+        # world-model gate's verdict for the iteration; nonfinite: the number of non-finite policy gradients
         carry = {"env": env, "buf": rb.init(c.buffer_steps, {k: jnp.zeros(v.shape, v.dtype) for k, v in rec_t.items()}),
                  "pi": pi, "avg": jax.tree.map(jnp.copy, pi), "wm": wm, "wm_b": wm_b,
                  "opt_pi": optim.init(pi, self.pi_mask), "opt_wm": optim.init(wm, self.wm_mask),
                  "key": ks[3], "it": jnp.zeros((), jnp.int32), "env_steps": jnp.zeros((), jnp.float32), "nonfinite": jnp.zeros((), jnp.int32),
                  "wm_ema": jnp.zeros((), jnp.float32), "gn_ema": jnp.zeros((), jnp.float32), "wm_ok": jnp.ones((), bool)}  # fmt: skip
+        # make weakly typed scalars strongly typed, so that the carry has the same types going into and coming out of each program
         strong = lambda x: jnp.asarray(x, dtype=x.dtype) if isinstance(x, jax.Array) and x.weak_type else x  # noqa: E731
         return jax.tree.map(strong, carry)
 
     # ------------------------------------------------------------------ collection
     def record(self, s, s1, tr):
-        """One step's record: the state the action was taken in with its task context (an imagination start), the PD input
-        and the state after the physics (a world-model transition), the dynamics context, flags."""
+        """One step's record for the replay buffer: the state the action was taken in with its task context (a start for
+        imagination), the PD target and the state after the physics (one world-model transition), the dynamics context xi, and
+        the done and termination flags and the reward."""
         rec = {"s_qpos": tr.qpos, "s_qvel": tr.qvel, "s1_qpos": tr.qpos1, "s1_qvel": tr.qvel1, "target": tr.target, "xi": self.sim.context(s),
                "a_last": s.a_last, "cmd": s.cmd, "phase": s.phase, "t": s.t, "freq": s.freq, "offset": s.offset, "delay": s.delay,
                "done": (tr.terminated | tr.truncated).astype(jnp.float32), "term": tr.terminated.astype(jnp.float32), "r": tr.reward}  # fmt: skip
@@ -169,13 +195,14 @@ class XSoma:
         s1, tr = self.sim.step(s, a)
         rec, stats = self.record(s, s1, tr)
         flat = rb.sanitize(rb.flatten(rec))
-        flat["ok"] = flat["ok"] * (1 - tr.diverged.astype(jnp.float32))
+        flat["ok"] = flat["ok"] * (1 - tr.diverged.astype(jnp.float32))  # a physics failure is not a valid transition
         stats = {**stats, "nonfinite_env": 1 - flat["ok"].mean()}
         return self.ingest({**carry, "env": s1}, flat), stats
 
     # ------------------------------------------------------------------ world model
     def wm_rollout(self, wm, wm_b, S, targets, xis, heights, unroll=True):
-        """Open-loop world-model states over a window's PD inputs, (B, k, ...) per state part."""
+        """Open-loop rollout of the world model from the state S, fed with a window's recorded PD targets and its own predictions.
+        Returns the k predicted states, (B, k, ...) per state part."""
 
         def step(S, x):
             tgt, xi = x
@@ -187,6 +214,9 @@ class XSoma:
         return tuple(jnp.swapaxes(P, 0, 1) for P in Ss)
 
     def wm_loss(self, wm, wm_b, w, heights):
+        """World-model loss on windows w: the squared open-loop error of every state dimension (in units of its typical one-step
+        change, at least its ERR_FLOOR), averaged over the dimensions and the windows, and summed over each window's valid steps.
+        Also returns the error at the last step of each window."""
         S_hat = self.wm_rollout(wm, wm_b, unflatten(w["s_qpos"][:, 0], w["s_qvel"][:, 0]), w["target"], w["xi"], heights)
         S_true = unflatten(w["s1_qpos"], w["s1_qvel"])
         std = jnp.maximum(nets.rn_std(wm_b["inc_norm"], 1e-4), self.err_floor)
@@ -194,6 +224,8 @@ class XSoma:
         return (e * w["mask"]).sum() / w["mask"].shape[0], e[:, -1]
 
     def wm_update(self, carry, key):
+        """One gradient step of the world model on replayed windows. The statistics are the loss per step and the error at the
+        window's last step."""
         c = self.cfg
         w = rb.sample_windows(carry["buf"], key, c.wm_batch, c.wm_window)
         (loss, e_last), grads = jax.value_and_grad(self.wm_loss, has_aux=True)(carry["wm"], carry["wm_b"], w, carry["env"].world.heights)
@@ -203,8 +235,9 @@ class XSoma:
         return {**carry, "wm": wm, "opt_wm": opt}, {"wm": loss / c.wm_window, "wm8": (e_last * m).sum() / jnp.maximum(m.sum(), 1)}
 
     def wm_eval(self, carry, key, B: int = 512, K: int = 32):
-        """Open-loop rollouts from real states with the recorded PD inputs over K steps (valid parts of the windows only):
-        pelvis height error at steps 8 and K, and the termination rate the env saw vs the one the model's states imply."""
+        """Check of the world model on real data, for the log only: open-loop rollouts of K steps from real states with the
+        recorded PD targets (valid steps of each window only). Returns the pelvis height error after 8 and after K steps, and how
+        often the simulator terminated against how often the model's states imply a termination."""
         heights = carry["env"].world.heights
         w = rb.sample_windows(carry["buf"], key, B, K)
         S_hat = self.wm_rollout(carry["wm"], carry["wm_b"], unflatten(w["s_qpos"][:, 0], w["s_qvel"][:, 0]), w["target"], w["xi"], heights,
@@ -220,8 +253,9 @@ class XSoma:
 
     # ------------------------------------------------------------------ imagination
     def sample_starts(self, buf, key):
-        """Imagination starts: replayed states with their task context; a share gets a fresh command (and gait frequency) and
-        its gait phase recomputed, since a command can change at any state (every 500 steps, and on the first step)."""
+        """Starting states for imagination: replayed states with their task context. A share (`cmd_fresh`) gets a freshly drawn
+        command and gait frequency, with the gait phase recomputed, because in the real task a new command can arrive at any
+        state (every 500 steps and after a reset)."""
         c, B = self.cfg, self.cfg.pi_batch
         k_s, k_u, k_c = jax.random.split(key, 3)
         start = rb.nest(rb.sample_starts(buf, k_s, B))
@@ -233,17 +267,18 @@ class XSoma:
         return start
 
     def termination(self, clearance):
-        """Imagined termination: forward exactly the geometric event (a termination collider below the terrain surface; agrees
-        with the env's contact-force termination on ~99 % of steps), gradient of the sigmoid of the smallest clearance."""
+        """Termination flags of imagined states. The value is the exact 0/1 event: a termination collider below the terrain
+        surface, which agrees with the simulator's contact-force termination on about 99 % of steps. The gradient is that of a
+        sigmoid of the smallest clearance, so that the policy gets a signal before the robot has fallen."""
         cmin = clearance.min(-1)
         soft = jax.nn.sigmoid(-cmin / self.cfg.term_tau)
         hard = (cmin < 0).astype(jnp.float32)
         return hard + soft - jax.lax.stop_gradient(soft)
 
     def imagine(self, pi, wm, wm_b, start, keys, scale, heights):
-        """Negative mean discounted return of `horizon` imagined steps from `start`, the task's step order: the policy acts on
-        the observation, the world model moves the robot, the reward and termination are read on the new state, then the gait
-        phase advances and the command resamples every 500 steps."""
+        """The loss of the policy update: the negative mean discounted return of `horizon` imagined steps from `start`. A step
+        follows the task's order: the policy acts on the observation, the world model moves the robot, the reward and the
+        termination are read on the new state, then the gait phase advances and the command resamples every 500 steps."""
         c, B = self.cfg, self.cfg.pi_batch
         bf16 = c.mm_bf16 in ("imag", "all")
         rcfg = self.sim.reward_cfg
@@ -255,6 +290,7 @@ class XSoma:
             k_o, k_c = jax.random.split(k)
             obs, _ = task.observations(v.robot, a_last, cmd, phase, k_o)
             a = nets.pi_apply(pi, obs, out_bf16=bf16)
+            # the PD target: an env with an action delay applies the previous action instead of this one
             tgt = jnp.clip(jnp.where(delay[:, None] == 0, a, a_last), -task.ACTION_CLIP, task.ACTION_CLIP)
             S1 = nets.wm_step(wm, wm_b, S, v.height, v.soles, target_q(tgt), xi, task.DT, out_bf16=bf16)
             v1 = self.sim.view_state(S1, heights)
@@ -277,20 +313,25 @@ class XSoma:
         alive_before = jnp.concatenate((jnp.ones_like(alive[:1]), alive[:-1]), 0)  # a step's reward counts if alive before it
         disc = c.gamma ** jnp.arange(c.horizon, dtype=jnp.float32)[:, None]
         G = (disc * alive_before * r).sum(0)
+        # statistics: mean return, mean reward per step, and the share of rollouts still alive at the end of the horizon
         return -G.mean(), {"G": G.mean(), "r": (alive_before * r).sum(0).mean() / c.horizon, "surv": alive[-1].mean()}
 
     def policy_update(self, carry, start, key):
+        """One gradient step of the policy through imagination. The step is skipped when the gradient norm is not finite or
+        exceeds `pi_gn_gate` times its running average."""
         c = self.cfg
         env = carry["env"]
         (_, aux), grads = jax.value_and_grad(self.imagine, has_aux=True)(carry["pi"], carry["wm"], carry["wm_b"], start, jax.random.split(key, c.horizon),
                                                                          env.scale, env.world.heights)  # fmt: skip
-        grads, gn = optim.clip_by_global_norm(grads, c.pi_clip)
+        grads, gn = optim.clip_by_global_norm(grads, c.pi_clip)  # gn is the norm before clipping
         finite = jnp.isfinite(gn)
         first = carry["gn_ema"] <= 0
         ok = finite & (first | (c.pi_gn_gate <= 0) | (gn < c.pi_gn_gate * carry["gn_ema"]))
+        # the average follows accepted steps and grows by 1 % after a skipped one, so that a lasting rise is accepted in the end
         gn_ema = jnp.where(ok, jnp.where(first, gn, 0.98 * carry["gn_ema"] + 0.02 * gn), 1.01 * carry["gn_ema"])
         grads = jax.tree.map(lambda g: jnp.where(ok, g, 0.0), grads)
         pi, opt_pi = optim.step(carry["pi"], grads, carry["opt_pi"], self.pi_mask, c.pi_lr, betas=(0.9, 0.95), ok=ok)
+        # the averaged policy is a copy of the policy at the first policy update, then follows it as an exponential moving average
         avg = optim.ema(carry["avg"], pi, c.pi_ema, carry["it"] == c.wm_only_iters)
         stats = {**aux, "gn": gn, "gn_gated": (finite & ~ok).astype(jnp.float32)}
         return {"pi": pi, "opt_pi": opt_pi, "avg": avg, "gn_ema": gn_ema, "nonfinite": carry["nonfinite"] + (~finite).astype(jnp.int32)}, stats
@@ -311,6 +352,7 @@ class XSoma:
         wm_now = wstats["wm"].mean()
         first = carry["wm_ema"] <= 0
         healthy = first | (c.wm_gate <= 0) | (wm_now < c.wm_gate * carry["wm_ema"])
+        # as for the gradient gate: the average grows by 0.5 % after an unhealthy iteration, so a lasting rise gets through
         wm_ema = jnp.where(healthy, jnp.where(first, wm_now, 0.98 * carry["wm_ema"] + 0.02 * wm_now), 1.005 * carry["wm_ema"])
         return {**carry, "wm_ema": wm_ema, "wm_ok": healthy}, {"wm": wm_now, "wm8": wstats["wm8"][-1]}
 
@@ -336,9 +378,10 @@ class XSoma:
         return {**carry, **sub, "key": key, "it": carry["it"] + 1}, {**pstats, "wm_gated": (active & ~carry["wm_ok"]).astype(jnp.float32)}
 
     def compile_programs(self, carry):
-        """AOT-compile an iteration as three donated programs (collection, world-model fits, policy updates) plus the world-model
-        check: lowered one after the other (tracing holds the GIL), compiled in parallel threads (XLA's backend compile releases
-        it), so the start-up waits for the largest program, not for their sum."""
+        """Compile the programs of an iteration ahead of time: collection, world-model fits and policy updates (each updates the
+        carry in place, by donation), plus the world-model check, which leaves the carry intact. Lowering (tracing) holds Python's
+        GIL, so the programs are lowered one after the other; XLA's compile step releases it, so they compile in parallel threads
+        and the start-up waits for the largest program, not for their sum."""
         lowered = {"collect": jax.jit(self.collect_iter, donate_argnums=(0,)).lower(carry),
                    "wm": jax.jit(self.wm_iter, donate_argnums=(0,)).lower(carry),
                    "pi": jax.jit(self.pi_iter, donate_argnums=(0,)).lower(carry)}  # fmt: skip
@@ -349,6 +392,8 @@ class XSoma:
 
 
 def save_ckpt(path, pi_avg, pi_live, meta):
+    """Write the averaged and the live policy to <path>.npz, through a temporary file so that a reader never sees a partial one,
+    and the metadata (iteration, times, env steps) to <path>.json."""
     flat = {}
     for name, layers in (("avg", pi_avg), ("live", pi_live)):
         for i, layer in enumerate(layers):
@@ -361,6 +406,7 @@ def save_ckpt(path, pi_avg, pi_live, meta):
 
 
 def parse(argv=None) -> Config:
+    """The Config given by the command-line flags, `--field value` for every field."""
     p = argparse.ArgumentParser(description="Train XSoma on Holosoma's G1 velocity-tracking task.")
     for f in dataclasses.fields(Config):
         p.add_argument(f"--{f.name}", type=type(f.default), default=f.default)
@@ -368,10 +414,11 @@ def parse(argv=None) -> Config:
 
 
 def main(argv=None):
+    """Train for `minutes`, log every `log_every` iterations and save checkpoints, then evaluate every checkpoint."""
     t_launch = time.time()  # the wall clock of a comparison counts from here (start-up and compilation included)
     cfg = parse(argv)
     flags = [f for f in cfg.xla_flags.split(",") if f.startswith("--")]
-    if flags:
+    if flags:  # XLA reads XLA_FLAGS when its backend starts, so they are set before XSoma(cfg) first uses the GPU
         os.environ["XLA_FLAGS"] = " ".join([os.environ.get("XLA_FLAGS", "")] + flags).strip()
     os.makedirs(os.path.join(cfg.log_dir, "ckpt"), exist_ok=True)
     with open(os.path.join(cfg.log_dir, "config.json"), "w") as f:
@@ -387,12 +434,13 @@ def main(argv=None):
     gc.collect()
     gc.freeze()  # Python's generation-2 collections would otherwise stall the host loop
     logf = open(os.path.join(cfg.log_dir, "log.jsonl"), "a", buffering=1)
-    t0 = time.time()
-    for _ in range(-(-cfg.warmup_steps // cfg.env_steps)):
+    t0 = time.time()  # the training clock: compilation is over, the warm-up counts
+    for _ in range(-(-cfg.warmup_steps // cfg.env_steps)):  # warm-up collection, rounded up to whole iterations
         carry, _ = progs["collect"](carry)
+    # time of the last checkpoint, checkpoint counter, and training time and env steps at the previous log line (for the speed)
     last_ckpt, n_ckpt, prev_s, prev_env = 0.0, 0, 0.0, 0.0
     while True:
-        cs, ls = [], []
+        cs, ls = [], []  # per-iteration statistics of the collection program and of the world-model and policy programs
         for _ in range(cfg.log_every):  # dispatched asynchronously; the host waits only for the statistics below
             carry, cstats = progs["collect"](carry)
             carry, wstats = progs["wm"](carry)
@@ -411,6 +459,12 @@ def main(argv=None):
         it, env_steps = int(carry["it"]), float(carry["env_steps"])
         rec = {"it": it, "train_s": train_s, "wall_s": time.time() - t_launch, "env_steps": env_steps, "nonfinite": int(carry["nonfinite"]), **stats}
         logf.write(json.dumps(rec) + "\n")
+        # The printed line: iteration, training time, env steps | len (mean length of finished episodes), lin and ang (Holosoma's
+        # tracking rewards of finished episodes), r (reward per step), s (penalty scale) | wm (world-model loss), e8 (its error at
+        # a window's 8th step) | G (imagined return), r_im (imagined reward per step), surv (imagined rollouts alive at the end),
+        # gn (policy gradient norm) | speed | h_err (pelvis height error of the open-loop model after 8 and 32 steps), term
+        # (termination rate of the simulator, of the model) | skipped policy updates (world-model gate, gradient gate) | physics
+        # failures
         print(f"it {it} | {train_s / 60:.2f} min | {env_steps / 1e6:.1f}M steps | len {stats['ep_len']:.0f} lin {stats['rew_tracking_lin_vel']:.3f} "
               f"ang {stats['rew_tracking_ang_vel']:.3f} r {stats['reward']:.4f} s {stats['scale']:.3f} | wm {stats['wm']:.4f} e8 {stats['wm8']:.4f} | "
               f"G {stats['G']:.3f} r_im {stats['r']:.4f} surv {stats['surv']:.3f} gn {stats['gn']:.2f} | {cfg.log_every / max(train_s - prev_s, 1e-9):.1f} it/s "
@@ -420,6 +474,7 @@ def main(argv=None):
               + (f" | diverged {stats['diverged']:.0f}" if stats["diverged"] else ""),
               flush=True)  # fmt: skip
         prev_s, prev_env = train_s, env_steps
+        # a checkpoint every ckpt_minutes, and a last one when training ends
         if train_s - last_ckpt >= 60 * cfg.ckpt_minutes or train_s >= 60 * cfg.minutes:
             save_ckpt(os.path.join(cfg.log_dir, "ckpt", f"{n_ckpt:04d}"), carry["avg"], carry["pi"],
                       {"it": it, "train_s": train_s, "wall_s": time.time() - t_launch, "env_steps": env_steps})  # fmt: skip
@@ -430,7 +485,7 @@ def main(argv=None):
     if cfg.eval_n > 0:
         from . import evaluate
 
-        del carry, progs, xs
+        del carry, progs, xs  # free the training state before the evaluation builds its own simulator
         gc.collect()
         evaluate.main([cfg.log_dir, "--n", str(cfg.eval_n), "--scale", str(cfg.eval_scale), "--sole_friction", str(cfg.eval_sole_friction),
                        "--preset", cfg.preset])  # fmt: skip

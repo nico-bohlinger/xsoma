@@ -1,8 +1,9 @@
 """MuonAdam and Adam as pure functions (as in XMimic: xmimic/optim.py, which matches blinkmimic/optim.py).
 
-Muon runs on the leaves where ``mask`` is True (hidden weight matrices), Adam on the rest. ``ok`` (0-dim bool) gates the whole
-step: where it is False, parameters and every optimizer state are returned unchanged (BlinkMimic's --no_sync skip of a
-non-finite policy update).
+Muon runs on the leaves where ``mask`` is True (the hidden weight matrices): it replaces a matrix's update by an approximately
+orthogonal one, found with a few Newton-Schulz iterations. Adam runs on all other leaves. ``ok`` (0-dim bool) gates the whole
+step: where it is False, parameters and every optimizer state are returned unchanged, so a skipped update leaves no trace
+(BlinkMimic's --no_sync skip of a non-finite policy update).
 """
 
 from __future__ import annotations
@@ -10,11 +11,12 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-NS_COEFFS = (3.4445, -4.775, 2.0315)
+NS_COEFFS = (3.4445, -4.775, 2.0315)  # the coefficients of Muon's quintic iteration
 
 
 def newton_schulz(G, steps: int = 5, eps: float = 1e-7):
-    """torch.optim._muon._zeropower_via_newtonschulz: quintic iteration in bf16 on the wide orientation of G."""
+    """Approximately orthogonalize G with Muon's quintic Newton-Schulz iteration, in bf16 on the wide orientation of G (as
+    torch.optim._muon._zeropower_via_newtonschulz)."""
     a, b, c = NS_COEFFS
     X = G.astype(jnp.bfloat16)
     tall = X.shape[0] > X.shape[1]
@@ -29,6 +31,8 @@ def newton_schulz(G, steps: int = 5, eps: float = 1e-7):
 
 
 def init(params, mask):
+    """Optimizer state: a momentum buffer for each Muon leaf, Adam's two moments for each other leaf, and a step count."""
+
     def leaf(p, m):
         return {"buf": jnp.zeros_like(p)} if m else {"m": jnp.zeros_like(p), "v": jnp.zeros_like(p)}
 
@@ -51,8 +55,8 @@ def step(params, grads, state, mask, lr, betas=(0.9, 0.999), eps: float = 1e-8, 
     def leaf(p, g, s, m):
         if m:
             buf = momentum * s["buf"] + (1 - momentum) * g
-            upd = newton_schulz(g + momentum * (buf - g)).astype(jnp.float32)
-            ratio = 0.2 * max(p.shape[0], p.shape[1]) ** 0.5
+            upd = newton_schulz(g + momentum * (buf - g)).astype(jnp.float32)  # Nesterov momentum, then orthogonalize
+            ratio = 0.2 * max(p.shape[0], p.shape[1]) ** 0.5  # gives the update about the RMS of an Adam update
             return p - lr * ratio * upd, {"buf": buf}
         mm = b1 * s["m"] + (1 - b1) * g
         vv = b2 * s["v"] + (1 - b2) * g * g
@@ -72,5 +76,6 @@ def step(params, grads, state, mask, lr, betas=(0.9, 0.999), eps: float = 1e-8, 
 
 
 def ema(avg, live, decay: float, first):
-    """AveragedModel EMA (get_ema_multi_avg_fn): the first update copies, later ones lerp toward the live weights."""
+    """Exponential moving average of the weights, avg + (1 - decay) * (live - avg), as torch's AveragedModel with
+    get_ema_multi_avg_fn. On the first update (`first` is True) it copies the live weights instead."""
     return jax.tree.map(lambda a, l: jnp.where(first, l, a + (1 - decay) * (l - a)), avg, live)
