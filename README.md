@@ -32,7 +32,7 @@ learner.
   others update the policy.
 
 <p align="center"><img src="figures/xsoma.gif" width="720" alt="The G1 walking over rough ground and pits under an XSoma policy, following a sequence of velocity commands"></p>
-<p align="center"><sub>The G1 driven by an XSoma policy after 14 minutes of training on one H100, following a smooth sequence
+<p align="center"><sub>The G1 driven by an XSoma policy after 46 seconds of training on four H100s, following a smooth sequence
 of velocity commands over Holosoma's rough ground and pits, replayed in MuJoCo.</sub></p>
 
 ## Results

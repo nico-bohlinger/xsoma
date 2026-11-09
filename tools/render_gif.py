@@ -2,12 +2,12 @@
 
     bash tools/download_meshes.sh                                                       # the G1's visual meshes, once
     python tools/rollout.py ckpt=<ckpt>.npz plan=tour ramp=0.8 pushes=0 tile=1,4        # on a GPU machine
-    python tools/render_gif.py rollout.npz --env 8 --start 3                            # -> figures/xsoma.gif
+    python tools/render_gif.py rollout.npz --env 12 --start 2.8 --seconds 7.5            # -> figures/xsoma.gif
 
 The numbers on the GIF come from results/ (tools/make_figures.py), not from arguments. The camera follows the robot through
-the command plan of the rollout. The published GIF shows seed 0 after 14 minutes of training (checkpoint 0012), robot 8 of the
-rollout above, which walks over a field of pits and rough ground. Rendering needs OpenGL (MUJOCO_GL=glfw by default; egl on a
-headless machine).
+the command plan of the rollout. The published GIF shows the 4-GPU run with seed 1 after 46 seconds of training (checkpoint
+0002), robot 12 of the rollout above, from recording second 2.8 to 10.3, where its legs never touch each other. Rendering
+needs OpenGL (MUJOCO_GL=glfw by default; egl on a headless machine).
 """
 
 from __future__ import annotations
