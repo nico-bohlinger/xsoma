@@ -294,7 +294,7 @@ Licenses and notices of the code and model XSoma derives from: [THIRD_PARTY_NOTI
 If you use XSoma in your research, please cite:
 
 ```bibtex
-@misc{bohlinger2026imagination,
+@misc{bohlinger2026xmimicxsoma,
   title  = {XMimic and XSoma: Learning Humanoid Motion Tracking and Locomotion in Under a Minute},
   author = {Bohlinger, Nico and Peters, Jan},
   year   = {2026},
