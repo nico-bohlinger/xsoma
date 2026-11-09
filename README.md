@@ -152,6 +152,9 @@ Why it is fast:
 
 - **The simulator stays on the GPU.** MuJoCo Warp runs Holosoma's whole task step, with physics, rewards, resets and
   pushes, at 250,000 robot steps per second on an H100 ([`tools/bench_sim.py`](tools/bench_sim.py)).
+- **Imagined steps are cheap.** On an H100, imagination (the policy, the world model and Holosoma's reward and termination
+  on the imagined states) produces the steps of 4096 robots about 65 times faster than the simulator under the same policy,
+  and a policy update with its backward pass still about 15 times faster ([`tools/bench_imagination.py`](tools/bench_imagination.py)).
 - **Three compiled programs.** Collection, world-model learning and policy learning are compiled XLA programs. Python only
   starts them and reads the logs every 50 iterations.
 - **Several GPUs.** With `--layout AL`, collecting and updating run at the same time on different GPUs, and every extra
@@ -230,6 +233,7 @@ python tools/check_sim.py                              # kinematics, terrain hei
 python tools/check_heads.py                            # imagination's rewards and terminations against the simulator's (GPU)
 python tools/stress_sim.py                             # physics failures under hard random actions, per terrain layout (GPU)
 python tools/bench_sim.py                              # simulator speed (GPU)
+python tools/bench_imagination.py                      # imagination against the simulator, steps per second (GPU)
 python tools/make_figures.py                           # the figures and the table above, from results/
 bash tools/download_meshes.sh && python tools/rollout.py ckpt=$(ls runs/xsoma/ckpt/*.npz | tail -1) && python tools/render_gif.py rollout.npz
 ```
@@ -263,7 +267,7 @@ docs/              holosoma_task.md: Holosoma's task, line by line
 results/           per-run evaluation files behind every number and figure
 figures/           figures and the GIF
 tools/             run_holosoma.sh, holosoma_ckpt.py, holosoma_dump.py (baselines and the test data), check_sim.py,
-                   check_heads.py, stress_sim.py, bench_sim.py (checks and speed), make_figures.py, rollout.py,
+                   check_heads.py, stress_sim.py, bench_sim.py, bench_imagination.py (checks and speed), make_figures.py, rollout.py,
                    render_gif.py, download_meshes.sh (figures and the GIF)
 tests/             equivalence tests against Holosoma and MuJoCo, and of the multi-GPU learners (CPU)
 ```
