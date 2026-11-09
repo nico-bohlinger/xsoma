@@ -28,24 +28,30 @@ from matplotlib.patches import PathPatch  # noqa: E402
 from matplotlib.path import Path  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-METHODS = ("xsoma_4gpu", "xsoma", "fast_sac", "ppo")  # results/<method>/; XSoma on four GPUs (--layout) when present
-LABEL = {"xsoma_4gpu": "XSoma, 4 GPUs", "xsoma": "XSoma", "fast_sac": "Holosoma FastSAC", "ppo": "Holosoma PPO"}
-GPUS = {"xsoma_4gpu": 4}  # GPUs per run, 1 unless listed
-# FastSAC's time to the target comes from runs with a checkpoint every ~15 s (14 min each), its learning curves and its
-# tracking after 15 minutes from runs of its whole 50-minute schedule with a checkpoint every minute
-LONG = {"fast_sac": "fast_sac_full"}
+METHODS = ("xsoma_4gpu", "xsoma_3gpu", "xsoma_2gpu", "xsoma", "fast_sac", "ppo")  # results/<method>/, those present
+LABEL = {"xsoma_4gpu": "XSoma, 4 GPUs", "xsoma_3gpu": "XSoma, 3 GPUs", "xsoma_2gpu": "XSoma, 2 GPUs", "xsoma": "XSoma",
+         "fast_sac": "Holosoma FastSAC", "ppo": "Holosoma PPO"}
+GPUS = {"xsoma_4gpu": 4, "xsoma_3gpu": 3, "xsoma_2gpu": 2}  # GPUs per run, 1 unless listed
+# Every method's runs cover the 15 minutes shown, with a checkpoint about every 15 s. Longer runs answer what lies beyond:
+# FastSAC's whole 50-minute schedule (its tracking at the end) and PPO's first hour (it does not reach the target in it).
+LONG = {"fast_sac": "fast_sac_full", "ppo": "ppo_full"}
 TARGET = {"rew_tracking_lin_vel": 0.95, "rew_tracking_ang_vel": 0.8}
-STEPS_PER = {"xsoma_4gpu": 1, "xsoma": 1, "fast_sac": 4096, "fast_sac_full": 4096, "ppo": 24 * 4096}  # env steps per unit of a record's "steps" (Holosoma: iterations)
+STEPS_PER = {"xsoma_4gpu": 1, "xsoma_3gpu": 1, "xsoma_2gpu": 1, "xsoma": 1, "fast_sac": 4096, "fast_sac_full": 4096, "ppo": 24 * 4096,
+             "ppo_full": 24 * 4096}  # env steps per unit of a record's "steps" (Holosoma: iterations)
 HELD = 3
 BUDGET = 15.0  # minutes shown: every method's comparison is decided within them
 METRICS = (("rew_tracking_lin_vel", "Velocity tracking", "Holosoma's Episode/rew_tracking_lin_vel (max 2.0); dashed: the target", 0.95),
            ("err_v", "Velocity error", "m/s, mean |command - velocity| while upright", None),
            ("success", "Episodes without a fall", "share of 2048 episodes of 20 s", None))  # fmt: skip
-THEMES = {  # XMimic's release palette: the method in teal, the baselines in grays, ink on white (dark: GitHub's background)
+# XMimic's release palette: XSoma in teal, one shade per GPU count (light theme: 1 GPU light to 4 GPUs dark; dark theme the
+# other way round, so more GPUs always stand out more), the baselines in grays outside the teal ramp's lightness range, so
+# every gray and teal stay apart under color blindness too (checked with OKLab differences of simulated protan, deutan and
+# tritan vision); ink on white (dark: GitHub's background). The combined paper's figures use the light theme's colors.
+THEMES = {
     "light": dict(surface="#ffffff", ink="#1d1d1f", ink2="#48484e", muted="#8e8e93", grid="#e5e5ea", axis="#c7c7cc",
-                  xsoma="#00b0be", xsoma_4gpu="#00b0be", fast_sac="#6e6e73", ppo="#aeaeb2"),
+                  xsoma="#0db3c1", xsoma_2gpu="#009aa8", xsoma_3gpu="#00818f", xsoma_4gpu="#006977", fast_sac="#3d3d40", ppo="#c3c3c8"),
     "dark": dict(surface="#0d1117", ink="#f0f6fc", ink2="#c9d1d9", muted="#8b949e", grid="#21262d", axis="#30363d",
-                 xsoma="#19c3d0", xsoma_4gpu="#19c3d0", fast_sac="#aeaeb2", ppo="#636366"),
+                 xsoma="#008492", xsoma_2gpu="#009aa8", xsoma_3gpu="#00b0be", xsoma_4gpu="#36c6d4", fast_sac="#f1f1f6", ppo="#525256"),
 }  # fmt: skip
 FONT = ["Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"]
 
@@ -69,6 +75,22 @@ def training_seconds(run, rows):
         excess = total[0] - pace * (it[0] + 1)  # the first logged interval covers iterations 0 to it[0]
         return [float(np.interp(r["steps"], it, total)) - excess for r in rows]  # Holosoma's steps are iterations
     return [r["wall_s"] for r in rows]  # no log: time since launch
+
+
+CURVE_ORDER = ("fast_sac", "ppo", "xsoma", "xsoma_2gpu", "xsoma_3gpu", "xsoma_4gpu")
+
+
+def spread(times):
+    """The range of the runs' times, or "every run" when they agree at two decimals (all passed at the same checkpoint)."""
+    lo, hi = f"{min(times):.2f}", f"{max(times):.2f}"
+    return "every run" if lo == hi else f"{lo}–{hi}"
+
+
+def never_end(summary, m):
+    """Minutes within which a method that never reached the target was trained: its longer runs where they exist (PPO's hour)
+    and also never reach it, else its own runs."""
+    long = summary.get(LONG.get(m))
+    return long["end"] if long and not long["held"] else summary[m]["end"]
 
 
 def name(m, present):
@@ -172,18 +194,17 @@ def learning_curves(results, theme, out):
     grid = np.linspace(0, BUDGET, 481)
     for ax, (key, title, sub, line) in zip(axes, METRICS):
         style_axes(ax, t)
-        for m in METHODS:
+        for m in CURVE_ORDER:  # the baselines first, then XSoma from 1 to 4 GPUs, the last on top
             if m not in results:
                 continue
-            v = curve(results[LONG.get(m, m)] if LONG.get(m) in results else results[m], key, grid)
+            v = curve(results[m], key, grid)
             with np.errstate(all="ignore"), warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)  # grid points no run covers
                 mean, lo, hi = np.nanmean(v, 0), np.nanmin(v, 0), np.nanmax(v, 0)
             live = ~np.isnan(v).any(0)  # where every run has data, so the mean never mixes different sets of runs
             ax.fill_between(grid[live], lo[live], hi[live], color=t[m], alpha=0.12, lw=0, zorder=2)
-            dashed = m == "xsoma" and "xsoma_4gpu" in results  # as in XMimic's figures: one GPU dashed, four solid
-            ax.plot(grid[live], mean[live], color=t[m], lw=2.0, ls=(0, (4, 2)) if dashed else "-", solid_capstyle="round",
-                    solid_joinstyle="round", zorder=3, label=name(m, results))  # fmt: skip
+            ax.plot(grid[live], mean[live], color=t[m], lw=2.0, solid_capstyle="round", solid_joinstyle="round", zorder=3,
+                    label=name(m, results))
         if line is not None:
             ax.axhline(line, color=t["muted"], lw=1.0, ls=(0, (4, 3)), zorder=1)
         ax.set_xlim(0, BUDGET)
@@ -197,11 +218,12 @@ def learning_curves(results, theme, out):
         if key == "err_v":
             ax.set_ylim(0, 1.2)
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper right", ncol=len(labels), frameon=False, fontsize=10, labelcolor=t["ink"], bbox_to_anchor=(0.995, 0.995))
+    fig.legend(handles, labels, loc="lower center", ncol=len(labels), frameon=False, fontsize=10, labelcolor=t["ink"], bbox_to_anchor=(0.5, 0.0),
+               columnspacing=2.2, handlelength=2.0)  # fmt: skip
     fig.text(0.008, 0.965, "Learning curves on H100 GPUs", ha="left", va="center", color=t["ink"], fontsize=13.5, fontweight="bold")
     fig.text(0.008, 0.905, "deterministic evaluation of every checkpoint; line: mean over runs, band: min to max", ha="left", va="center",
              color=t["ink2"], fontsize=10)  # fmt: skip
-    fig.tight_layout(rect=(0, 0, 1, 0.86), w_pad=2.5)
+    fig.tight_layout(rect=(0, 0.07, 1, 0.86), w_pad=2.5)
     fig.savefig(os.path.join(out, f"learning_curves{'_dark' if theme == 'dark' else ''}.png"), dpi=200, facecolor=t["surface"])
     plt.close(fig)
 
@@ -229,7 +251,8 @@ def time_to_target_figure(summary, theme, out):
             label = f"{mean:.2f} min" + (f"   ({len(s['held'])} of {runs})" if len(s["held"]) < s["runs"] else "")
             ax.text(max(s["held"]) + top * 0.02, i, label, va="center", ha="left", color=t["ink"], fontsize=10.5)
         else:
-            ax.text(top * 0.01, i, f"not reached in {5 * round(s['end'] / 5):.0f} min ({runs})", va="center", ha="left", color=t["ink2"], fontsize=10.5)
+            ax.text(top * 0.01, i, f"not reached in {5 * round(never_end(summary, m) / 5):.0f} min ({runs})", va="center", ha="left",
+                    color=t["ink2"], fontsize=10.5)  # fmt: skip
     ax.set_yticks(range(n), [name(m, keys) for m in keys], color=t["ink"], fontsize=11)
     ax.set_xticks(np.arange(0, top + 1, 5))
     ax.set_xlabel("minutes of training (start-up and compilation excluded)", color=t["ink2"], fontsize=10)
@@ -250,14 +273,13 @@ def table(summary):
             continue
         s = summary[m]
         if s["held"]:
-            tt = f"{np.mean(s['held']):.2f} ({min(s['held']):.2f}–{max(s['held']):.2f})" if len(s["held"]) > 1 else f"{s['held'][0]:.2f}"
+            tt = f"{np.mean(s['held']):.2f} ({spread(s['held'])})" if len(s["held"]) > 1 else f"{s['held'][0]:.2f}"
             tt += f", {len(s['held'])} of {s['runs']} runs" if len(s["held"]) < s["runs"] else ""
         else:
-            tt = f"not within {5 * round(s['end'] / 5):.0f}"  # the run length
+            tt = f"not within {5 * round(never_end(summary, m) / 5):.0f}"  # the run length
         sp = f"{ref / np.mean(s['held']):.1f}×" if ref and s["held"] and len(s["held"]) == s["runs"] else "–"
         st = f"{np.mean(s['steps']) / 1e6:.0f} M" if s["steps"] else "–"
-        q = summary.get(LONG.get(m), s)  # tracking after BUDGET minutes from the runs that are that long
-        at = f"{q[f'err_v@{BUDGET}']:.2f} m/s, {100 * (1 - q[f'success@{BUDGET}']):.1f} %" if f"err_v@{BUDGET}" in q else "–"
+        at = f"{s[f'err_v@{BUDGET}']:.2f} m/s, {100 * (1 - s[f'success@{BUDGET}']):.1f} %" if f"err_v@{BUDGET}" in s else "–"
         lines.append(f"| {name(m, summary)} | {s['runs']} | {tt} | {sp} | {st} | {at} |")
     return "\n".join(lines)
 
@@ -274,7 +296,7 @@ def layouts_table(root=os.path.join(ROOT, "results")):
                 r["min"] = t / 60
             log = [json.loads(line) for line in open(os.path.join(os.path.dirname(path), "log.jsonl"))]
             cfg = json.load(open(os.path.join(os.path.dirname(path), "config.json")))
-            learners = int(cfg.get("learners") or 1)
+            learners = int(cfg.get("learners") or 0) or max(GPUS.get(k, 1) - 1, 1)  # 0: every GPU but the actor's
             steps = learners * -(-int(cfg["pi_updates"]) // learners) if cfg.get("layout", "1GPU") != "1GPU" else int(cfg["pi_updates"])
             runs.append((time_to_target(sorted(ev, key=lambda r: r["min"])), log[-1]["it"] / log[-1]["train_s"], log[-1]["env_steps"] / log[-1]["train_s"], steps))
         rows[k] = runs
@@ -284,7 +306,7 @@ def layouts_table(root=os.path.join(ROOT, "results")):
     for k, runs in rows.items():
         held = [r[0] for r in runs if r[0] is not None]
         n = 1 if k == "xsoma" else int(k.split("_")[1][:-3])
-        tt = f"{np.mean(held):.2f} ({min(held):.2f}–{max(held):.2f})" if held else "–"
+        tt = f"{np.mean(held):.2f} ({spread(held)})" if held else "–"
         lines.append(f"| {n} | {len(runs)} | {np.mean([r[1] for r in runs]):.1f} | {np.mean([r[2] for r in runs]) / 1e3:.0f} k | {runs[0][3]} | {tt} | "
                      f"{one / np.mean(held):.1f}× |" if held and one else "–")  # fmt: skip
     return "\n".join(lines)

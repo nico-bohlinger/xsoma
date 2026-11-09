@@ -31,7 +31,7 @@ from xsoma import scene, terrain  # noqa: E402
 W, H, PANEL = 960, 540, 470  # render size and the width of the robot panel on the right
 BG = (255, 255, 255)  # XMimic's release palette: white, ink, the method in teal, the baselines in grays
 INK, INK2 = (29, 29, 31), (72, 72, 78)
-TEAL, GRAY, LIGHT = (0, 176, 190), (110, 110, 115), (174, 174, 178)
+TEAL, GRAY = (0, 176, 190), (110, 110, 115)
 
 
 def font(size, bold=False):
@@ -113,9 +113,7 @@ def text_panel(summ):
     d.text((x, 305), "Holosoma's tracking bar", font=font(32), fill=INK)
     rows = [(f"{t_best:.2f} min", TEAL, "XSoma, 4 H100s")] if "xsoma_4gpu" in summ else []
     rows += [(f"{t_x:.2f} min", TEAL, "XSoma, 1 H100"), (f"{t_f:.2f} min", GRAY, "FastSAC, 1 H100")]
-    if "ppo" in summ:
-        ppo = summ["ppo"]["held"]
-        rows.append((f"{np.mean(ppo):.2f} min" if ppo else f"> {5 * round(summ['ppo']['end'] / 5):.0f} min", LIGHT, "PPO, 1 H100"))  # the run length
+    # PPO is left out, as in the release video: it does not reach the bar within its hour (the README's table says so)
     num, small = (font(40, bold=True), font(26)) if len(rows) <= 3 else (font(34, bold=True), font(23))
     off = int(max(d.textlength(r[0], font=num) for r in rows)) + 16
     y0, dy = (372, 50) if len(rows) <= 3 else (360, 43)

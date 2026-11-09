@@ -2,8 +2,8 @@
 
 **Humanoid velocity tracking on rough terrain, learned in under a minute.** XSoma trains the Unitree G1 task of
 [Holosoma](https://github.com/amazon-far/holosoma) with a learned world model: the policy improves by backpropagating
-Holosoma's own reward through motions it imagines. On four H100s it reaches Holosoma's own tracking bar after 0.81 minutes
-of training, 10.6× sooner than Holosoma's FastSAC on one. On a single H100 it takes 2.50 minutes, 3.5× sooner. Holosoma's
+Holosoma's own reward through motions it imagines. On four H100s it reaches Holosoma's own tracking bar after 0.77 minutes
+of training, 12.3× sooner than Holosoma's FastSAC on one. On a single H100 it takes 2.50 minutes, 3.8× sooner. Holosoma's
 PPO does not reach the bar within an hour.
 
 Paper: [XMimic and XSoma: Learning Humanoid Motion Tracking and Locomotion in Under a Minute](https://nico-bohlinger.github.io/papers/2026_xmimic_xsoma.pdf)
@@ -12,7 +12,7 @@ Please [cite it](#citation) if you use XSoma.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="figures/time_to_target_dark.png">
-  <img alt="Training time to Holosoma's FastSAC tracking bar on H100s: XSoma on 4 GPUs 0.81 min, XSoma on 1 GPU 2.50 min, Holosoma FastSAC 8.64 min, Holosoma PPO not reached in 60 min" src="figures/time_to_target.png">
+  <img alt="Training time to Holosoma's FastSAC tracking bar on H100s: XSoma on 4, 3, 2 and 1 GPUs 0.77, 1.02, 1.38 and 2.50 min, Holosoma FastSAC 9.44 min, Holosoma PPO not reached in 60 min" src="figures/time_to_target.png">
 </picture>
 
 ## What XSoma is
@@ -42,23 +42,25 @@ backend, and every checkpoint is evaluated the same way. The baselines and XSoma
 
 | method | runs | time to target (min) | speedup | env steps to target | after 15 min: velocity error, falls |
 |---|---|---|---|---|---|
-| XSoma, 4 GPUs | 8 | **0.81** (0.76–1.02) | **10.6×** | 5 M | – |
-| XSoma, 1 GPU | 5 | 2.50 (2.30–2.64) | 3.5× | 5 M | 0.33 m/s, 0.4 % |
-| Holosoma FastSAC | 4 | 8.64 (8.21–8.92) | 1.0× | 37 M | 0.49 m/s, 0.4 % |
-| Holosoma PPO | 4 | not within 60 | – | – | 0.64 m/s, 10.7 % |
+| XSoma, 4 GPUs | 8 | **0.77** (every run) | **12.3×** | 5 M | 0.31 m/s, 0.4 % |
+| XSoma, 3 GPUs | 4 | 1.02 (0.84–1.12) | 9.2× | 6 M | 0.31 m/s, 0.3 % |
+| XSoma, 2 GPUs | 4 | 1.38 (1.38–1.39) | 6.8× | 5 M | 0.31 m/s, 0.4 % |
+| XSoma, 1 GPU | 5 | 2.50 (2.30–2.64) | 3.8× | 5 M | 0.33 m/s, 0.4 % |
+| Holosoma FastSAC | 8 | 9.44 (8.77–10.82) | 1.0× | 40 M | 0.49 m/s, 0.4 % |
+| Holosoma PPO | 4 | not within 60 | – | – | 0.66 m/s, 25.5 % |
 
 Times are means over runs (range in brackets), in minutes of training with start-up and compilation excluded.
 
 - **The target** is Holosoma's own bar for FastSAC, from its nightly test: a velocity-tracking score of at least 0.95 and a
   yaw-rate score of at least 0.8 in Holosoma's metrics. Here it has to hold for three checkpoints in a row.
 - **Under a minute on four GPUs.** One GPU collects experience while three others update the policy, so XSoma takes three
-  update steps per iteration and runs 3.4 times as many iterations per second. Seven of the eight runs pass in under a
-  minute, the slowest after 1.02 minutes.
+  update steps per iteration and runs 3.4 times as many iterations per second. All eight runs pass in under a minute,
+  each from its third checkpoint on, after 0.77 minutes.
 - **Better tracking, not only sooner.** After 15 minutes, XSoma's velocity error on one GPU is a third lower than FastSAC's.
   FastSAC does not get there even at the end of its 50-minute schedule (0.47 m/s).
 - **Far fewer simulated steps.** XSoma spends most of its time learning rather than simulating. It reaches the target after
-  5 million environment steps, FastSAC after 37 million.
-- **PPO** comes closest after about 12 minutes. Then its penalty curriculum, which raises the penalties once the robot stays
+  5 million environment steps, FastSAC after 40 million.
+- **PPO** comes closest after about 11 minutes. Then its penalty curriculum, which raises the penalties once the robot stays
   upright, pulls its tracking down for the rest of the hour.
 
 <picture>
@@ -71,10 +73,11 @@ Times are means over runs (range in brackets), in minutes of training with start
 
 <br>
 
-- **Hardware.** One H100 (95 GB) per run, four runs per node, all on the same cluster.
+- **Hardware.** H100s (95 GB), all on the same cluster.
 - **Baselines.** Holosoma at commit `79ba714`, presets `g1_29dof_fast_sac` and `g1_29dof`, unmodified, on its MuJoCo Warp
-  backend at terrain scale 0.5 with 4096 robots ([`tools/run_holosoma.sh`](tools/run_holosoma.sh)). FastSAC ran its whole
-  schedule (50,000 iterations, about 50 minutes) and PPO one hour of its 25,000 iterations (about 7 hours at this speed).
+  backend at terrain scale 0.5 with 4096 robots ([`tools/run_holosoma.sh`](tools/run_holosoma.sh)). Besides the 15-minute
+  runs, FastSAC also ran its whole schedule (50,000 iterations, about 50 minutes) and PPO one hour of its 25,000 iterations
+  (about 7 hours at this speed).
 - **Evaluation.** Every checkpoint of every method drives 2048 robots for one 20-s episode each, with the policy's mean
   action and Holosoma's randomization, pushes and commands, on the same terrain and the same episodes
   ([`xsoma/evaluate.py`](xsoma/evaluate.py)). Holosoma's checkpoints are converted to plain arrays
@@ -83,15 +86,15 @@ Times are means over runs (range in brackets), in minutes of training with start
 - **Training time.** XSoma compiles before its clock starts. Holosoma compiles inside its training loop, so the extra time
   of its first logged interval (about 12 s for FastSAC, 0.3 s for PPO) is subtracted from its checkpoint times, as XMimic
   does for BlinkMimic ([`results/README.md`](results/README.md)).
-- **Checkpoints.** XSoma and FastSAC save one about every 15 seconds of training (XSoma `--ckpt_minutes 0.25`, FastSAC
-  `--algo.config.save-interval=250`), so the times to the target are resolved to about 15 seconds. PPO saves one every
-  100 iterations (1.7 minutes), which does not matter as it never reaches the target. FastSAC's time to the target comes
-  from these runs (14 minutes each), its learning curves and its tracking after 15 minutes from four runs of its whole
-  50-minute schedule with a checkpoint every minute (`results/fast_sac_full`).
-- **GPUs.** The 1-GPU runs shared a node with three other runs, the multi-GPU runs had a node to themselves. The multi-GPU
-  runs used the layout code before it moved into this repository, with the same programs (`tests/test_multi_gpu.py`).
+- **Checkpoints.** Every method saves one about every 15 seconds of training (XSoma `--ckpt_minutes 0.25`, FastSAC
+  `--algo.config.save-interval=250`, PPO `--algo.config.save-interval=15`), so the times to the target are resolved to
+  about 15 seconds, and every run trains for at least 15 minutes, so every learning curve covers the whole figure. The
+  longer runs answer what comes after: FastSAC's tracking at the end of its schedule (`results/fast_sac_full`) and PPO's
+  hour (`results/ppo_full`).
+- **GPUs.** The 1-GPU runs shared a node with three other runs, the 2-GPU runs with one other run and the 3-GPU runs with
+  an evaluation on the fourth GPU; the 4-GPU runs had a node to themselves.
 - **Data.** Every number and figure comes from the files in [`results/`](results/), through
-  [`tools/make_figures.py`](tools/make_figures.py). The 1-GPU runs trained for 15 minutes and the multi-GPU runs for 4 to 5.
+  [`tools/make_figures.py`](tools/make_figures.py).
 
 </details>
 
@@ -103,9 +106,9 @@ Times are means over runs (range in brackets), in minutes of training with start
 | GPUs | runs | iterations/s | env steps/s | policy updates per iteration | time to target (min) | speedup over 1 GPU |
 |---|---|---|---|---|---|---|
 | 1 | 5 | 6.8 | 28 k | 2 | 2.50 (2.30–2.64) | 1.0× |
-| 2 | 4 | 12.9 | 53 k | 2 | 1.39 (1.32–1.59) | 1.8× |
-| 3 | 4 | 23.0 | 94 k | 2 | 1.02 (1.00–1.04) | 2.5× |
-| 4 | 8 | 22.9 | 94 k | 3 | 0.81 (0.76–1.02) | 3.1× |
+| 2 | 4 | 12.5 | 52 k | 2 | 1.38 (1.38–1.39) | 1.8× |
+| 3 | 4 | 23.3 | 96 k | 2 | 1.02 (0.84–1.12) | 2.4× |
+| 4 | 8 | 23.3 | 95 k | 3 | 0.77 (every run) | 3.3× |
 
 Times are means over runs (range in brackets), in minutes of training with start-up and compilation excluded.
 
@@ -133,8 +136,9 @@ Every iteration does three things, about seven times per second on an H100.
 
 What mattered most:
 
-- **Holosoma's exact reward in imagination.** With the true reward and terrain at every imagined step, one second of
-  imagination is enough. XSoma needs no learned reward and no critic, and a critic made tracking slower.
+- **Holosoma's own reward in imagination, not a learned one.** Every imagined step is scored with Holosoma's reward and
+  termination functions, using the true terrain height under the feet. With these exact scores, one second of imagination
+  is enough. XSoma needs no learned reward and no critic, and a critic made tracking slower.
 - **Two policy updates per simulated step.** Learning more from every collected step pays off in wall-clock time. Fewer
   updates learned slower and collapsed in some runs.
 - **Half of the robots without noise.** When every collected action is noisy, the policy comes to rely on the noise and,

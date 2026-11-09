@@ -6,7 +6,7 @@
  "preset": "fast_sac",
  "sole_friction": 1,
  "random_start": 1,
- "minutes": 5.0,
+ "minutes": 15.0,
  "env_steps": 1,
  "buffer_steps": 200,
  "warmup_steps": 32,
@@ -21,7 +21,7 @@
  "wm_eval": 1,
  "horizon": 48,
  "pi_batch": 2048,
- "pi_updates": 1,
+ "pi_updates": 2,
  "pi_lr": 0.0003,
  "pi_clip": 1.0,
  "pi_gn_gate": 10.0,
@@ -44,5 +44,5 @@
  "jax_cache": "~/.cache/xsoma/jax",
  "xla_flags": "--xla_gpu_enable_triton_gemm=false",
  "layout": "AL",
- "learners": 2
+ "learners": 0
 }
